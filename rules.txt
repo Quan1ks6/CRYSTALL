@@ -1,0 +1,9 @@
+DOMAIN,vk.com,Direct
+PROCESS-NAME,steamwebhelper.exe,direct
+PROCESS-NAME,steam.exe,direct
+DOMAIN,animego.me,direct
+DOTDOMAIN,.ru,Direct
+PROCESS-NAME,Discord.exe,Proxy
+PROCESS-NAME,Telegram.exe,Proxy
+PROCESS-NAME,firefox.exe,proxy
+MATCH,direct
