@@ -4,6 +4,7 @@ dual-core proxy client.
 Клиент построен на базе ядра sing-box, что позволяет использовать правила маршрутизации как для
 xray, так и для sing-box в целом.
 CRYSTALL поддерживает парсинг ссылок панелей 3x-ui, CELERITY, S-UI и остальных.
+Пока что поддерживает только VLESS и Hysteria2.
 
 # DUAL-CORE
 
@@ -18,12 +19,15 @@ Sing-box в данном случае является ТОЛЬКО маршру
 
 Правила были организованы на подобии Clash системы.
 PROCESS-NAME, PROCESS-PATH, DOMAIN, DOTDOMAIN (тот же DOMAIN-SUFFIX), DOMAIN-SUFFIX, MATCH
-Учтите, что правило MATCH не имеет value, и ставиться в конце файла rules.txt. Иначе правила, стоящие после MATCH будут пропущены.
+Учтите, что правило MATCH не имеет value, и ставиться в конце. Иначе правила, стоящие после MATCH будут пропущены.
 Правила применяются сверху вниз, верхнее правило побеждает.
 
-# TODO
-Интеграция zapret и его совместимость с правилами.
-Улучшение UI и исправление некоторых UI багов
-Открыть код на гитхаб
-Больше гибкости
-Переписание некоторых модулей на GoLang
+Учтите, некоторые блоки кода написаны AI.
+
+# Большое Спасибо:
+sing-box - https://github.com/SagerNet/sing-box
+xray - https://github.com/XTLS/Xray-core
+Clash Verge Rev - https://github.com/clash-verge-rev/clash-verge-rev
+V2rayN - https://github.com/2dust/v2rayN
+
+Этот клиент написан под меня и мои потербности и потребности моих друзей. Но я буду рад вашим Pull Requests! Это мой первый проект, не судите строго :)
