@@ -1,4 +1,3 @@
-# runner.py — HTTP API Edition
 import os
 import sys
 import json
@@ -11,23 +10,30 @@ import urllib.request
 import urllib.error
 
 SERVICE_NAME = "sb-hy2-svc"
-API_BASE = "http://127.0.0.1:33212"
+DEFAULT_SVC_PORT = 33212
 
-# Абсолютный путь к директории приложения — совпадает с _BASE в gui3.py
 _BASE = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
         else os.path.dirname(os.path.abspath(__file__))
 _LOG_DIR  = os.path.join(_BASE, "logs")
-_LOG_FILE       = os.path.join(_LOG_DIR, "sb.log")          # sing-box лог
-_XRAY_LOG_FILE  = os.path.join(_LOG_DIR, "xray.log")         # xray лог (primary ИЛИ secondary)
+_LOG_FILE       = os.path.join(_LOG_DIR, "sb.log")
+_XRAY_LOG_FILE  = os.path.join(_LOG_DIR, "xray.log")
+_SETTINGS_FILE  = os.path.join(_BASE, "settings.json")
 
+def get_service_port() -> int:
+    try:
+        with open(_SETTINGS_FILE, encoding="utf-8") as f:
+            return int(json.load(f).get("service_port", DEFAULT_SVC_PORT))
+    except Exception:
+        return DEFAULT_SVC_PORT
 
-# ── Проверка прав ──────────────────────────────────────────────────────────────
+def _api_base() -> str:
+    return f"http://127.0.0.1:{get_service_port()}"
+
 def is_admin() -> bool:
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
-
 
 def relaunch_as_admin():
     script = os.path.abspath(sys.argv[0])
@@ -44,8 +50,6 @@ def relaunch_as_admin():
 
     return ret > 32
 
-
-# ── Service status ────────────────────────────────────────────────────────────
 def service_installed() -> bool:
     try:
         r = subprocess.run(
@@ -59,7 +63,6 @@ def service_installed() -> bool:
 
     except Exception:
         return False
-
 
 def service_running() -> bool:
     try:
@@ -75,8 +78,6 @@ def service_running() -> bool:
     except Exception:
         return False
 
-
-# ── HTTP API ──────────────────────────────────────────────────────────────────
 def _api_post(path: str, payload: dict | None = None, timeout: float = 5.0):
     try:
         data = None
@@ -85,7 +86,7 @@ def _api_post(path: str, payload: dict | None = None, timeout: float = 5.0):
             data = json.dumps(payload).encode("utf-8")
 
         req = urllib.request.Request(
-            API_BASE + path,
+            _api_base() + path,
             data=data,
             headers={"Content-Type": "application/json"},
             method="POST"
@@ -100,11 +101,9 @@ def _api_post(path: str, payload: dict | None = None, timeout: float = 5.0):
             "message": str(e)
         }
 
-
-
 def _api_get(path: str, timeout: float = 5.0):
     try:
-        with urllib.request.urlopen(API_BASE + path, timeout=timeout) as resp:
+        with urllib.request.urlopen(_api_base() + path, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
 
     except Exception as e:
@@ -113,15 +112,11 @@ def _api_get(path: str, timeout: float = 5.0):
             "message": str(e)
         }
 
-
-
 def service_api_alive() -> bool:
     r = _api_get("/status")
 
     return r.get("service") == "RUNNING"
 
-
-# ── Install / uninstall service ───────────────────────────────────────────────
 def install_service() -> tuple[bool, str]:
     _BASE = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
             else os.path.dirname(os.path.abspath(__file__))
@@ -188,8 +183,6 @@ def install_service() -> tuple[bool, str]:
 
     return False, "Timeout"
 
-
-
 def uninstall_service() -> tuple[bool, str]:
     if is_admin():
         subprocess.run(
@@ -235,15 +228,8 @@ def uninstall_service() -> tuple[bool, str]:
 
     return False, "Timeout"
 
-
-# ── Очистка логов ──────────────────────────────────────────────────────────────
 def clear_logs():
-    """
-    Стирает логи sing-box и Xray (sb.log, xray.log).
-    Вызывается при каждом старте приложения и по кнопке 'CLEAR' в LogPanel.
-    Не трогает logs/sb_service.log — это персистентный лог самого
-    Windows-сервиса, не привязанный к запускам GUI.
-    """
+    
     os.makedirs(_LOG_DIR, exist_ok=True)
     for path in (_LOG_FILE, _XRAY_LOG_FILE):
         try:
@@ -251,25 +237,37 @@ def clear_logs():
         except Exception as e:
             print(f"clear_logs: не удалось очистить {path}: {e}")
 
+def _adapter_exists(name: str) -> bool:
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f'(Get-NetAdapter -Name "{name}" -ErrorAction SilentlyContinue) -ne $null'],
+            capture_output=True, text=True, timeout=4,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        return r.stdout.strip().lower() == "true"
+    except Exception:
+        return False
 
-# ── Очистка перед стартом ─────────────────────────────────────────────────────
-def cleanup_stale_state(tun_interface_names: tuple[str, ...] = ("sb-tun", "xray-tun")):
-    """
-    Убирает "хвосты" от прошлого аварийного завершения ДО старта новых
-    процессов. Без этого sing-box иногда падает с
-    'FATAL cannot create file that already exists' (зависший TUN-адаптер
-    с тем же именем) или просто не может забиндить занятый процессом-зомби
-    порт.
+def _process_running(image: str) -> bool:
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"IMAGENAME eq {image}", "/NH"],
+            text=True, timeout=3,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        return image.lower() in out.lower()
+    except Exception:
+        return False
 
-    Что делает:
-      1. taskkill зомби-процессов sing-box.exe / xray.exe (если сервис не
-         запущен от их имени — обычные пользовательские процессы из
-         предыдущего краша GUI).
-      2. Снимает все TUN-адаптеры из tun_interface_names через PowerShell
-         Remove-NetAdapter (без ошибки если адаптера и не было).
-    """
-    # 1. Зомби-процессы (best-effort, не критично если не получится)
+def cleanup_stale_state(tun_interface_names: tuple[str, ...] = ("sb-tun", "xray-tun"),
+                         max_wait: float = 6.0):
+    
+    t0 = time.monotonic()
+
     for image in ("sing-box.exe", "xray.exe"):
+        if not _process_running(image):
+            continue
         try:
             subprocess.run(
                 ["taskkill", "/F", "/IM", image],
@@ -278,9 +276,20 @@ def cleanup_stale_state(tun_interface_names: tuple[str, ...] = ("sb-tun", "xray-
             )
         except Exception:
             pass
+        while _process_running(image) and (time.monotonic() - t0) < max_wait:
+            time.sleep(0.2)
 
-    # 2. Зависшие TUN-адаптеры
     for name in tun_interface_names:
+        if not _adapter_exists(name):
+            continue
+        try:
+            subprocess.run(
+                ["netsh", "interface", "set", "interface", name, "admin=disabled"],
+                capture_output=True, timeout=3,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        except Exception:
+            pass
         try:
             subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -290,39 +299,38 @@ def cleanup_stale_state(tun_interface_names: tuple[str, ...] = ("sb-tun", "xray-
             )
         except Exception:
             pass
-        try:
-            subprocess.run(
-                ["netsh", "interface", "set", "interface", name, "admin=disabled"],
-                capture_output=True, timeout=3,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-        except Exception:
-            pass
 
+        remaining = max_wait - (time.monotonic() - t0)
+        while _adapter_exists(name) and remaining > 0:
+            time.sleep(0.3)
+            try:
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                     f'Remove-NetAdapter -Name "{name}" -Confirm:$false -ErrorAction SilentlyContinue'],
+                    capture_output=True, timeout=4,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+            except Exception:
+                pass
+            remaining = max_wait - (time.monotonic() - t0)
 
 class Runner:
     def __init__(self):
         self.proc  = None
-        self.proc2 = None        # Вторичный процесс (Xray-бэкенд при VLESS TUN)
+        self.proc2 = None
         self._log_fh  = None
         self._log_fh2 = None
         self._via_service = False
 
     def start(self, config: str, use_tun: bool = False, sudo_password: str = None,
               core: str = "singbox", force_direct: bool = False) -> bool:
-        """
-        core: "singbox" (default) | "xray"
-        force_direct: True → никогда не использовать сервис (для dual-process режима).
-          В VLESS TUN dual-режиме sing-box стартует напрямую (force_direct=True),
-          чтобы сервис не перехватил конфиг и не запустил не тот бинарник.
-        """
+        
         if self.proc:
             self.stop()
 
         if use_tun and not force_direct and service_installed():
             config_path = os.path.abspath(config)
 
-            # Для xray передаём binary_path, чтобы сервис знал что запускать
             payload: dict = {"config_path": config_path}
             if core == "xray":
                 xray_exe = self._find_xray()
@@ -354,9 +362,6 @@ class Runner:
             except:
                 pass
 
-        # Лог идёт в отдельный файл в зависимости от движка — иначе при
-        # одновременной работе (dual-core) логи sing-box и Xray перемешиваются
-        # в одном файле и фильтр по источнику в GUI становится бессмысленным.
         log_path = _XRAY_LOG_FILE if core == "xray" else _LOG_FILE
         self._log_fh = open(
             log_path,
@@ -364,7 +369,6 @@ class Runner:
             encoding="utf-8"
         )
 
-        # Выбираем бинарник в зависимости от протокола
         if core == "xray":
             exe = self._find_xray()
             if not exe:
@@ -397,16 +401,13 @@ class Runner:
 
         if self._via_service:
             _api_post("/stop")
-            # Ждём пока sing-box действительно остановится (сервис async),
-            # иначе TUN-адаптер может ещё висеть когда мы стартуем снова.
-            for _ in range(30):   # до 3 секунд
+            for _ in range(30):
                 time.sleep(0.1)
                 st = _api_get("/status")
                 if not st.get("running", True):
                     break
             self.proc = None
             self._via_service = False
-            # Останавливаем вторичный процесс (Xray-бэкенд) если был запущен
             self._stop_secondary()
             return
 
@@ -435,11 +436,10 @@ class Runner:
 
                 self._log_fh = None
 
-        # Останавливаем Xray-бэкенд если был запущен (VLESS TUN режим)
         self._stop_secondary()
 
     def _stop_secondary(self):
-        """Останавливает вторичный процесс (Xray-бэкенд для VLESS TUN)."""
+        
         if not self.proc2:
             return
         try:
@@ -463,12 +463,8 @@ class Runner:
                 self._log_fh2 = None
 
     def start_secondary(self, config: str, core: str = "xray") -> bool:
-        """
-        Запускает вторичный процесс (Xray SOCKS5-бэкенд) для VLESS TUN-режима.
-        Вызывается ДО start() с sing-box TUN, чтобы Xray успел поднять SOCKS5.
-        Лог пишется в logs/xray_backend.log (отдельно от основного sb.log).
-        """
-        self._stop_secondary()   # убиваем предыдущий если был
+        
+        self._stop_secondary()
 
         exe = self._find_xray() if core == "xray" else self._find_singbox()
         if not exe:
@@ -477,8 +473,6 @@ class Runner:
 
         config_path = os.path.abspath(config)
         os.makedirs(_LOG_DIR, exist_ok=True)
-        # Тот же файл что и для primary-Xray — источник один и тот же (xray.exe),
-        # фильтру в GUI достаточно знать ИМЯ файла, не важно, primary или secondary.
         log_path = _XRAY_LOG_FILE if core == "xray" else _LOG_FILE
 
         try:
@@ -497,12 +491,7 @@ class Runner:
 
     @staticmethod
     def force_kill(engine: str):
-        """
-        Жёстко убивает процесс движка по имени, независимо от того, кто его
-        запустил (GUI напрямую, сервис, или он стал зомби после краша).
-        engine: "singbox" | "xray"
-        Используется по кнопке 'Kill process' при клике на индикатор.
-        """
+        
         image = "sing-box.exe" if engine == "singbox" else "xray.exe"
         try:
             subprocess.run(
@@ -531,7 +520,7 @@ class Runner:
 
     @staticmethod
     def _find_xray() -> str | None:
-        """Ищет xray.exe рядом с приложением или в PATH."""
+        
         import shutil
 
         candidates = [

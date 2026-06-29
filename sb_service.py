@@ -1,14 +1,3 @@
-# sb_service.py
-# Windows Service for sing-box
-# HTTP API architecture (Clash Verge style)
-#
-# GUI <-> localhost HTTP
-# NO named pipes
-# NO ConnectNamedPipe freezes
-#
-# Service runs sing-box as SYSTEM
-# so TUN works without UAC
-
 import sys
 import os
 import json
@@ -26,19 +15,14 @@ import win32serviceutil
 import win32service
 import win32event
 import servicemanager
+import win32timezone
 
-
-# ── CONFIG ────────────────────────────────────────────────────────────────────
 SVC_NAME = "sb-hy2-svc"
 
 SVC_HOST = "127.0.0.1"
 
-SVC_PORT = 33212
+DEFAULT_SVC_PORT = 33212
 
-
-# ── BASE DIR ──────────────────────────────────────────────────────────────────
-# Windows Service любит внезапно жить в System32.
-# Поэтому жёстко фиксируем cwd.
 if getattr(sys, "frozen", False):
 
     _BASE = os.path.dirname(
@@ -53,8 +37,16 @@ else:
 
 os.chdir(_BASE)
 
+def _load_svc_port() -> int:
 
-# ── LOGGING ───────────────────────────────────────────────────────────────────
+    try:
+        with open(os.path.join(_BASE, "settings.json"), encoding="utf-8") as f:
+            return int(json.load(f).get("service_port", DEFAULT_SVC_PORT))
+    except Exception:
+        return DEFAULT_SVC_PORT
+
+SVC_PORT = _load_svc_port()
+
 LOG_DIR = os.path.join(_BASE, "logs")
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -75,13 +67,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-
-# ── FIND BINARY ───────────────────────────────────────────────────────────────
 def _find_binary(binary_path: str = None):
-    """
-    Если binary_path указан явно — проверяем и используем его.
-    Иначе ищем sing-box.exe (дефолтный бинарник).
-    """
+
     if binary_path:
         abs_path = os.path.abspath(binary_path)
         logging.info(f"BINARY OVERRIDE: {abs_path}")
@@ -91,9 +78,7 @@ def _find_binary(binary_path: str = None):
 
     return _find_singbox()
 
-
 def _find_singbox():
-    """Ищет sing-box.exe рядом с приложением или в PATH."""
 
     candidates = [
 
@@ -124,29 +109,22 @@ def _find_singbox():
         or shutil.which("sing-box.exe")
     )
 
-
-# ── SHARED STATE ──────────────────────────────────────────────────────────────
 _state = {
 
     "proc": None,
 
     "log_fh": None,
 
-    # RLock ВАЖЕН:
-    # start_core -> stop_core
-    # иначе deadlock
     "lock": threading.RLock()
 }
 
-
-# ── CORE START ────────────────────────────────────────────────────────────────
 def _start_core(config_path: str, binary_path: str = None) -> dict:
 
     with _state["lock"]:
 
         _stop_core_locked()
 
-        exe = _find_binary(binary_path)   # sing-box по умолчанию, xray если указан
+        exe = _find_binary(binary_path)
 
         logging.info(
             f"START config={config_path}"
@@ -204,8 +182,6 @@ def _start_core(config_path: str, binary_path: str = None) -> dict:
                 stdout=fh,
                 stderr=subprocess.STDOUT,
 
-                # IMPORTANT:
-                # no CREATE_NEW_PROCESS_GROUP
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
 
@@ -233,8 +209,6 @@ def _start_core(config_path: str, binary_path: str = None) -> dict:
                 "message": str(e)
             }
 
-
-# ── CORE STOP LOCKED ──────────────────────────────────────────────────────────
 def _stop_core_locked():
 
     proc = _state["proc"]
@@ -285,8 +259,6 @@ def _stop_core_locked():
 
         _state["log_fh"] = None
 
-
-# ── CORE STOP ─────────────────────────────────────────────────────────────────
 def _stop_core() -> dict:
 
     with _state["lock"]:
@@ -297,8 +269,6 @@ def _stop_core() -> dict:
         "status": "ok"
     }
 
-
-# ── STATUS ────────────────────────────────────────────────────────────────────
 def _get_status() -> dict:
 
     with _state["lock"]:
@@ -316,20 +286,19 @@ def _get_status() -> dict:
 
         "status": "ok",
 
+        "service": "RUNNING",
+
         "running": running,
 
         "pid": pid
     }
 
-
-# ── HTTP HANDLER ──────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
 
         logging.info(fmt % args)
 
-    # ── SEND JSON ──────────────────────────────────────────────────────────
     def _send_json(
         self,
         data: dict,
@@ -354,7 +323,6 @@ class Handler(BaseHTTPRequestHandler):
 
         self.wfile.write(body)
 
-    # ── READ JSON ──────────────────────────────────────────────────────────
     def _read_json(self) -> dict:
 
         try:
@@ -383,7 +351,6 @@ class Handler(BaseHTTPRequestHandler):
 
             return {}
 
-    # ── GET ────────────────────────────────────────────────────────────────
     def do_GET(self):
 
         if self.path == "/status":
@@ -402,10 +369,8 @@ class Handler(BaseHTTPRequestHandler):
             404
         )
 
-    # ── POST ───────────────────────────────────────────────────────────────
     def do_POST(self):
 
-        # ── START ────────────────────────────────────────────────────────
         if self.path == "/start":
 
             body = self._read_json()
@@ -427,7 +392,6 @@ class Handler(BaseHTTPRequestHandler):
 
                 return
 
-            # binary_path опциональный — если не указан, сервис использует sing-box
             binary_path = body.get("binary_path", None)
 
             self._send_json(
@@ -436,7 +400,6 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
-        # ── STOP ─────────────────────────────────────────────────────────
         if self.path == "/stop":
 
             self._send_json(
@@ -453,8 +416,6 @@ class Handler(BaseHTTPRequestHandler):
             404
         )
 
-
-# ── WINDOWS SERVICE ───────────────────────────────────────────────────────────
 class SbHy2Service(
     win32serviceutil.ServiceFramework
 ):
@@ -469,7 +430,6 @@ class SbHy2Service(
         "Runs sing-box as SYSTEM for TUN mode"
     )
 
-    # ── INIT ───────────────────────────────────────────────────────────────
     def __init__(self, args):
 
         super().__init__(args)
@@ -485,7 +445,6 @@ class SbHy2Service(
 
         self._server = None
 
-    # ── STOP ───────────────────────────────────────────────────────────────
     def SvcStop(self):
 
         logging.info(
@@ -514,7 +473,6 @@ class SbHy2Service(
             self._stop_event
         )
 
-    # ── RUN ────────────────────────────────────────────────────────────────
     def SvcDoRun(self):
 
         logging.info(
@@ -541,7 +499,7 @@ class SbHy2Service(
 
             logging.info(
                 f"HTTP API STARTED ON "
-                f"{SVC_HOST}:{SVC_PORT}"
+                f"{SVC_HOST}:{SVC_PORT}  (settings.json service_port={SVC_PORT})"
             )
 
             threading.Thread(
@@ -557,14 +515,20 @@ class SbHy2Service(
                 win32event.INFINITE
             )
 
+        except OSError as e:
+
+            logging.error(
+                f"BIND FAILED on {SVC_HOST}:{SVC_PORT} — {e}. "
+                f"Скорее всего порт занят другим процессом. "
+                f"Смени порт в Settings → SERVICE на свободный."
+            )
+
         except Exception:
 
             logging.exception(
                 "SERVICE FAILED"
             )
 
-
-# ── ENTRY ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
 
     if len(sys.argv) == 1:

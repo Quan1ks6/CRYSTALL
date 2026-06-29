@@ -1,4 +1,3 @@
-# builder.py — генератор конфигов sing-box >= 1.13
 import subprocess
 import re
 from rules import get_route_rules
@@ -12,10 +11,6 @@ def _is_ip(address: str) -> bool:
         return False
 
 def get_default_gateway() -> str | None:
-    """
-    Определяет IP дефолтного шлюза через 'route print 0.0.0.0'.
-    Возвращает строку IP или None.
-    """
     try:
         out = subprocess.check_output(
             ["route", "print", "0.0.0.0"],
@@ -31,7 +26,6 @@ def get_default_gateway() -> str | None:
     return None
 
 def _dns_direct_server() -> dict:
-    """UDP резолвер для бутстрапа — хардкод 8.8.8.8, не зависит от системы."""
     return {
         "tag":    "dns-direct",
         "type":   "udp",
@@ -40,7 +34,6 @@ def _dns_direct_server() -> dict:
 
 
 def _outbound(p: dict) -> dict:
-    """Hysteria2 outbound. uTLS не используем — несовместимо с QUIC."""
     server_addr = p.get("resolved_ip") or p["host"]
 
     tls: dict = {
@@ -57,7 +50,6 @@ def _outbound(p: dict) -> dict:
         "type":        "hysteria2",
         "tag":         "proxy-out",
         "server":      server_addr,
-        "server_port": p["port"],
         "password":    p["password"],
         "domain_resolver": {
             "server":   "dns-direct",
@@ -65,6 +57,25 @@ def _outbound(p: dict) -> dict:
         },
         "tls": tls,
     }
+
+    hop = p.get("port_hopping")
+    ranges = []
+    if hop:
+        for part in hop.split(","):
+            part = part.strip()
+            if "-" in part:
+                a, b = part.split("-", 1)
+                if a.isdigit() and b.isdigit():
+                    ranges.append(f"{a}:{b}")
+            elif part.isdigit():
+                ranges.append(part)
+
+    if ranges:
+        ob["server_ports"] = ranges
+        ob["hop_interval"] = "30s"
+    else:
+        ob["server_port"] = p["port"]
+
     if p.get("obfs") == "salamander" and p.get("obfs_password"):
         ob["obfs"] = {
             "type":     "salamander",
@@ -74,7 +85,6 @@ def _outbound(p: dict) -> dict:
 
 
 def build_proxy(p: dict, s: dict = None) -> dict:
-    """PROXY режим — HTTP/SOCKS5 на 127.0.0.1:2080."""
     if s is None: s = {}
     
     return {
@@ -100,7 +110,6 @@ def build_proxy(p: dict, s: dict = None) -> dict:
             "tag":         "mixed-in",
             "listen":      "127.0.0.1",
             "listen_port": 2080
-            # СНИФФИНГА ЗДЕСЬ БОЛЬШЕ НЕТ
         }],
         "outbounds": [
             _outbound(p),
@@ -112,7 +121,7 @@ def build_proxy(p: dict, s: dict = None) -> dict:
 def _build_route_proxy(p: dict) -> dict:
     user_rules, final = get_route_rules()
     system_rules = [
-        {"action": "sniff"}, # <--- Сниффинг теперь живет тут
+        {"action": "sniff"},
         {"domain": [p["host"]], "outbound": "direct"},
     ]
     return {
@@ -139,7 +148,6 @@ def _build_exclude_address(s: dict) -> list[str]:
 
 
 def build_tun(p: dict, s: dict = None) -> dict:
-    """TUN режим — весь трафик системы через прокси, без DNS-утечек."""
     if s is None: s = {}
 
     exclude_addr = _build_exclude_address(s)
@@ -170,9 +178,9 @@ def build_tun(p: dict, s: dict = None) -> dict:
             "final":    "dns-remote",
         },
         "inbounds": [{
-            "type":                  "tun", # или "mixed"
+            "type":                  "tun",
             "tag":                   "tun-in",
-            "interface_name":        "sb-tun", # Возвращаем старый добрый interface_name!
+            "interface_name":        "sb-tun",
             "address":               ["172.19.0.1/30"],
             "mtu":                   int(s.get("tun_mtu", 1500)),
             "auto_route":            s.get("tun_auto_route", True),
@@ -268,9 +276,9 @@ def build_tun_via_socks(p: dict, socks_port: int = 2081, s: dict = None) -> dict
             "final":    "dns-remote",
         },
         "inbounds": [{
-            "type":                  "tun", # или "mixed"
+            "type":                  "tun",
             "tag":                   "tun-in",
-            "interface_name":        "sb-tun", # Возвращаем старый добрый interface_name!
+            "interface_name":        "sb-tun",
             "address":               ["172.19.0.1/30"],
             "mtu":                   int(s.get("tun_mtu", 1500)),
             "auto_route":            s.get("tun_auto_route", True),
@@ -323,10 +331,8 @@ def _vless_tls(p: dict) -> dict | None:
 
 
 def _vless_transport(p: dict) -> dict | None:
-    """Строит блок transport для sing-box VLESS outbound (совместимо с 1.13+)."""
     transport = p.get("transport", "tcp")
 
-    # В sing-box 1.13+ транспорта 'xhttp' нет, вместо него используется 'http'
     if transport in ("splithttp", "xhttp", "h2"):
         transport = "http"
     elif transport == "mkcp":
@@ -344,13 +350,11 @@ def _vless_transport(p: dict) -> dict | None:
                 t["headers"] = {"Host": p["host_header"]}
 
         case "http":
-            # Универсальный HTTP транспорт в 1.13+ (сюда входят h2, xhttp/splithttp)
             t["path"] = p.get("path", "/")
             
             if p.get("host_header"):
                 t["host"] = [p["host_header"]]
                 
-            # Черный список параметров, которые переварит только Xray
             xray_exclusive = {
                 "xPaddingBytes", 
                 "scMaxEachPostBytes", 
@@ -360,10 +364,9 @@ def _vless_transport(p: dict) -> dict | None:
                 "scv"
             }
             
-            # Копируем кастомные заголовки, отсекая несовместимый мусор
             for k, v in p.get("xhttp_extra", {}).items():
                 if k in xray_exclusive:
-                    continue # Игнорируем Xray-параметры, чтобы sing-box не паниковал
+                    continue
                 if k not in ("mode", "host") and k not in t:
                     t[k] = v
 
@@ -432,7 +435,6 @@ def _build_route_tun_vless_native(p: dict) -> dict:
 
 
 def build_vless_tun_native(p: dict, s: dict = None) -> dict:
-    """TUN-режим для VLESS через sing-box 1.13+ (нативный)."""
     if s is None: s = {}
 
     exclude_addr = _build_exclude_address(s)
@@ -463,9 +465,9 @@ def build_vless_tun_native(p: dict, s: dict = None) -> dict:
             "final":    "dns-remote",
         },
         "inbounds": [{
-            "type":                  "tun", # или "mixed"
+            "type":                  "tun",
             "tag":                   "tun-in",
-            "interface_name":        "sb-tun", # Возвращаем старый добрый interface_name!
+            "interface_name":        "sb-tun",
             "address":               ["172.19.0.1/30"],
             "mtu":                   int(s.get("tun_mtu", 1500)),
             "auto_route":            s.get("tun_auto_route", True),

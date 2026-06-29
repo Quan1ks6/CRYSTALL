@@ -16,6 +16,7 @@ try:
     from hy2_parser import parse_hy2
     from vless_parser import parse_vless
     from pinger import TcpPingThread, UrlPingThread
+    import cluster_manager as cm
 except ImportError:
     def is_admin(): return False
     def relaunch_as_admin(): return False
@@ -43,20 +44,34 @@ except ImportError:
         result = pyqtSignal(bool, float, int)
         def __init__(self, url="", proxy=None, timeout=10.0): super().__init__()
         def run(self): QThread.msleep(400); self.result.emit(True, 42.0, 204)
+    import types
+    cm = types.SimpleNamespace(
+        CLUSTERS_DIR=os.path.join(os.path.dirname(os.path.abspath(__file__)), "clusters"),
+        list_cluster_files=lambda: [],
+        load_cluster=lambda p: {},
+        save_cluster=lambda p, d: None,
+        create_empty_cluster=lambda name, mode="proxy", color=None: "",
+        create_subscription_cluster=lambda name, url, profiles, color=None: "",
+        delete_cluster=lambda p: None,
+        update_cluster_meta=lambda *a, **k: None,
+        add_manual_inbound=lambda p, link: {},
+        delete_inbound=lambda p, i: None,
+        rename_inbound=lambda p, i, n: None,
+        refresh_subscription=lambda p, timeout=15.0: 0,
+        DEFAULT_PALETTE=["#7c3aed"],
+    )
 
-# ── Пути ──────────────────────────────────────────────────────────────────────
 _BASE = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
         else os.path.dirname(os.path.abspath(__file__))
 CLUSTERS_DIR  = os.path.join(_BASE, "clusters")
 RULES_FILE    = os.path.join(_BASE, "rules.txt")
-PRESETS_FILE  = os.path.join(_BASE, "presets.json") 
+PRESETS_FILE  = os.path.join(_BASE, "presets.json")
 LOG_FILE      = os.path.join(_BASE, "logs", "sb.log")
 XRAY_LOG_FILE = os.path.join(_BASE, "logs", "xray.log")
 SETTINGS_FILE = os.path.join(_BASE, "settings.json")
 os.makedirs(CLUSTERS_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
-# ── Сохранение/восстановление сессии ─────────────────────────────────────────
 SESSION_FILE = os.path.join(_BASE, "session.json")
 
 def save_session(profile: dict, mode: str, cluster_file: str):
@@ -79,7 +94,6 @@ def clear_session():
     except Exception:
         pass
 
-# ── Автостарт Windows (реестр) ────────────────────────────────────────────────
 APP_NAME    = "sb-hy2"
 
 def get_autostart() -> bool:
@@ -103,8 +117,6 @@ def set_autostart(enable: bool):
     except OSError:
         pass
 
-
-# ── Настройки ─────────────────────────────────────────────────────────────────
 def load_settings() -> dict:
     defaults = {
         "autostart": False,
@@ -117,11 +129,11 @@ def load_settings() -> dict:
         "sniff": True,
         "route_exclude_auto_gw": True,
         "route_exclude_address": ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"],
+        "service_port": 33212,
     }
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
             loaded = json.load(f)
-        # Мержим: не затираем новые дефолты если ключа нет
         for k, v in defaults.items():
             loaded.setdefault(k, v)
         return loaded
@@ -132,43 +144,24 @@ def save_settings(s: dict):
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(s, f, indent=2)
 
-# ── Обновление подписок ───────────────────────────────────────────────────────
 class SubUpdateWorker(QThread):
-    progress = pyqtSignal(str)   
-    finished = pyqtSignal(int, int)  
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(int, int)
 
     def run(self):
         updated = 0; errors = 0
-        for f in glob.glob(os.path.join(CLUSTERS_DIR, "*.clust")):
+        for f in cm.list_cluster_files():
             try:
-                with open(f, encoding="utf-8") as j: d = json.load(j)
-                url = d.get("source_url")
-                if not url: continue
+                d = cm.load_cluster(f)
+                if not d.get("source_url"):
+                    continue
                 self.progress.emit(d.get("name", f))
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    raw = resp.read().decode().strip()
-                raw += "=" * ((4 - len(raw) % 4) % 4)
-                decoded = base64.b64decode(raw).decode()
-                profs = []
-                for line in decoded.splitlines():
-                    line = line.strip()
-                    if line.startswith("hysteria2://"):
-                        try: profs.append(parse_hy2(line))
-                        except Exception: pass
-                    elif line.startswith("vless://"):
-                        try: profs.append(parse_vless(line))
-                        except Exception: pass
-                if profs:
-                    d["profiles"] = profs
-                    with open(f, "w", encoding="utf-8") as j:
-                        json.dump(d, j, indent=2, ensure_ascii=False)
-                    updated += 1
+                cm.refresh_subscription(f)
+                updated += 1
             except Exception as e:
                 print(f"Sub update error {f}: {e}"); errors += 1
         self.finished.emit(updated, errors)
 
-# ── Обновление resolved_ip во всех кластерах ─────────────────────────────────
 class ResolveWorker(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(int)
@@ -184,8 +177,6 @@ class ResolveWorker(QThread):
                     host = p.get("host", "")
                     if not host: continue
                     self.progress.emit(host)
-                    # Используем vless_parser._resolve для vless (он тот же алгоритм)
-                    # hy2_parser._resolve совместим с обоими
                     new_ip = _resolve(host)
                     if new_ip and new_ip != p.get("resolved_ip"):
                         p["resolved_ip"] = new_ip; changed = True; count += 1
@@ -196,7 +187,6 @@ class ResolveWorker(QThread):
                 print(f"Resolve error {f}: {e}")
         self.finished.emit(count)
 
-# ── Цвета и стили ─────────────────────────────────────────────────────────────
 C_ACCENT = QColor("#7c3aed")
 C_ON     = QColor("#10b981")
 C_OFF    = QColor("#ef4444")
@@ -264,6 +254,8 @@ def table_style() -> str:
         "padding:5px 4px;color:#7c9cbf;font-family:monospace;font-size:9px;"
         "font-weight:bold;}"
         "QHeaderView{background:#1e2a3a;}"
+        "QTableCornerButton::section{"
+        "background:#1e2a3a;border:none;border-bottom:1px solid #334155;}"
         "QScrollBar:vertical{background:#0f172a;width:8px;border-radius:4px;}"
         "QScrollBar::handle:vertical{background:#334155;border-radius:4px;min-height:20px;}"
         "QScrollBar::handle:vertical:hover{background:#7c3aed;}"
@@ -285,7 +277,6 @@ def fmt_bytes(n: int) -> str:
     if n < 1024**3: return f"{n/1024**2:.1f} MB"
     return f"{n/1024**3:.2f} GB"
 
-# ── ФОН: ЖИВАЯ СЕТКА ──────────────────────────────────────────────────────────
 class BackgroundWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -311,7 +302,6 @@ class BackgroundWidget(QWidget):
         p.setBrush(QColor(124,58,237,180)); p.setPen(Qt.PenStyle.NoPen)
         for pt in self.pts: p.drawEllipse(pt["pos"], 1.5, 1.5)
 
-# ── КНОПКА-ЛЕПЕСТОК ───────────────────────────────────────────────────────────
 class CyberBlade(QWidget):
     clicked = pyqtSignal()
     def __init__(self, label, angle, parent=None):
@@ -353,7 +343,6 @@ class CyberBlade(QWidget):
             p.setFont(QFont("monospace", 8, QFont.Weight.Bold))
             p.drawText(QRectF(-bw/2,-bh/2,bw,bh), Qt.AlignmentFlag.AlignCenter, self.label)
 
-# ── ЦЕНТРАЛЬНЫЙ АЛМАЗ ─────────────────────────────────────────────────────────
 class DiamondWidget(QWidget):
     clicked = pyqtSignal()
     def __init__(self, parent=None):
@@ -378,21 +367,12 @@ class DiamondWidget(QWidget):
         p.setPen(Qt.GlobalColor.white); p.setFont(QFont("monospace",10,QFont.Weight.Bold))
         p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.state.upper())
 
-# ── ИНДИКАТОР-ЛЕПЕСТОК ────────────────────────────────────────────────────────
 class PetalIndicator(QWidget):
-    """
-    Маленький лепесток-индикатор с тремя состояниями:
-      'inactive' — тёмный (не активен)
-      'active'   — зелёный (работает)
-      'error'    — красный (упал / ошибка)
-
-    Кликабелен: по клику эмиттит clicked(label) — MainWindow показывает
-    меню 'Kill process / Выйти' (см. _on_indicator_clicked).
-    """
+    
     clicked = pyqtSignal(str)
 
     _COLORS = {
-        "inactive": (QColor("#1e293b"), QColor("#334155")),   # fill, border
+        "inactive": (QColor("#1e293b"), QColor("#334155")),
         "active":   (QColor("#064e3b"), QColor("#10b981")),
         "error":    (QColor("#450a0a"), QColor("#ef4444")),
     }
@@ -401,7 +381,7 @@ class PetalIndicator(QWidget):
         super().__init__(parent)
         self.label  = label
         self._state = "inactive"
-        self._phase = random.random() * 6.28   # случайный сдвиг пульса
+        self._phase = random.random() * 6.28
         self.setFixedSize(80, 36)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._timer = QTimer(self, interval=40, timeout=self._tick)
@@ -415,7 +395,7 @@ class PetalIndicator(QWidget):
         self.update()
 
     def set_state(self, state: str):
-        """state: 'inactive' | 'active' | 'error'"""
+        
         if state == self._state:
             return
         self._state = state
@@ -436,12 +416,10 @@ class PetalIndicator(QWidget):
 
         fill_c, border_c = self._COLORS.get(self._state, self._COLORS["inactive"])
 
-        # Пульс для активных состояний
         pulse = 0.0
         if self._state != "inactive":
             pulse = math.sin(self._phase) * 0.18
 
-        # Лепесток — параллелограмм с закруглёнными углами
         off = 6
         path = QPainterPath()
         path.moveTo(off,       2)
@@ -450,7 +428,6 @@ class PetalIndicator(QWidget):
         path.lineTo(2,         H - 2)
         path.closeSubpath()
 
-        # Свечение
         if self._state != "inactive":
             alpha = int(40 + 30 * pulse)
             glow_c = QColor(border_c.red(), border_c.green(), border_c.blue(), alpha)
@@ -462,21 +439,17 @@ class PetalIndicator(QWidget):
             inflate = int(4 + 3 * pulse)
             p.drawEllipse(QRectF(-inflate, -inflate, W + inflate*2, H + inflate*2))
 
-        # Тело
         bc = QColor(border_c.red(), border_c.green(), border_c.blue(),
                     int(200 + 55 * (1 + pulse)))
         p.setBrush(fill_c)
         p.setPen(QPen(bc, 1.2))
         p.drawPath(path)
 
-        # Лейбл
         lbl_c = border_c if self._state != "inactive" else QColor("#475569")
         p.setPen(lbl_c)
         p.setFont(QFont("monospace", 7, QFont.Weight.Bold))
         p.drawText(QRectF(0, 0, W, H - 2), Qt.AlignmentFlag.AlignCenter, self.label)
 
-
-# ── ТУМБЛЕР PROXY / TUN ───────────────────────────────────────────────────────
 class ModeToggle(QWidget):
     toggled = pyqtSignal(str)
     def __init__(self, parent=None):
@@ -517,7 +490,6 @@ class ModeToggle(QWidget):
         p.setPen(Qt.GlobalColor.white if self._mode=="tun" else QColor("#64748b"))
         p.drawText(QRectF(W//2,0,W//2,H), Qt.AlignmentFlag.AlignCenter, "TUN")
 
-# ── КНОПКА ШЕСТЕРЁНКИ ─────────────────────────────────────────────────────────
 class GearButton(QWidget):
     clicked = pyqtSignal()
     def __init__(self, parent=None):
@@ -554,13 +526,8 @@ class GearButton(QWidget):
         p.setBrush(c); p.setPen(Qt.PenStyle.NoPen); p.drawPath(path)
         p.setBrush(QColor("#1a1a2e")); p.drawEllipse(QPointF(0,0), r_hole, r_hole)
 
-# ── ДИАЛОГ НАСТРОЕК ───────────────────────────────────────────────────────────
 class SettingsDialog(QDialog):
-    """
-    Настройки с боковой навигацией через QStackedWidget.
-    Страницы: APP  |  TUN & NETWORK  |  SERVICE
-    Все данные буферизуются в self._s и сохраняются одной кнопкой.
-    """
+    
     _COMMON = (
         "QCheckBox{color:#e2e8f0;font-family:monospace;font-size:10px;spacing:8px;}"
         "QCheckBox::indicator{width:15px;height:15px;border-radius:4px;"
@@ -586,7 +553,6 @@ class SettingsDialog(QDialog):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Header ────────────────────────────────────────────────────────────
         self._hdr = QLabel("⚙  SETTINGS")
         self._hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._hdr.setStyleSheet(
@@ -595,16 +561,14 @@ class SettingsDialog(QDialog):
             "border-bottom:1px solid #2d3748;")
         root.addWidget(self._hdr)
 
-        # ── Stack ─────────────────────────────────────────────────────────────
         self._stack = QStackedWidget()
         root.addWidget(self._stack, 1)
 
-        self._stack.addWidget(self._page_main())     # 0 — главное меню
-        self._stack.addWidget(self._page_app())      # 1
-        self._stack.addWidget(self._page_tun())      # 2
-        self._stack.addWidget(self._page_service())  # 3
+        self._stack.addWidget(self._page_main())
+        self._stack.addWidget(self._page_app())
+        self._stack.addWidget(self._page_tun())
+        self._stack.addWidget(self._page_service())
 
-        # ── Bottom bar ────────────────────────────────────────────────────────
         bot = QHBoxLayout()
         bot.setContentsMargins(12, 6, 12, 10)
         bot.setSpacing(8)
@@ -623,7 +587,6 @@ class SettingsDialog(QDialog):
 
         self._go_main()
 
-    # ── Navigation ────────────────────────────────────────────────────────────
     def _go_main(self):
         self._stack.setCurrentIndex(0)
         self._hdr.setText("⚙  SETTINGS")
@@ -647,7 +610,6 @@ class SettingsDialog(QDialog):
             "QPushButton:pressed{background:#0f0f20;}")
         return b
 
-    # ── PAGE 0: menu ─────────────────────────────────────────────────────────
     def _page_main(self) -> QWidget:
         w = QWidget(); lay = QVBoxLayout(w)
         lay.setContentsMargins(20, 20, 20, 8); lay.setSpacing(10)
@@ -663,7 +625,6 @@ class SettingsDialog(QDialog):
         lay.addStretch()
         return w
 
-    # ── PAGE 1: APP ───────────────────────────────────────────────────────────
     def _page_app(self) -> QWidget:
         w = QWidget(); lay = QVBoxLayout(w)
         lay.setContentsMargins(16, 12, 16, 8); lay.setSpacing(10)
@@ -684,12 +645,10 @@ class SettingsDialog(QDialog):
         lay.addWidget(grp); lay.addStretch()
         return w
 
-    # ── PAGE 2: TUN ───────────────────────────────────────────────────────────
     def _page_tun(self) -> QWidget:
         w = QWidget(); lay = QVBoxLayout(w)
         lay.setContentsMargins(16, 12, 16, 8); lay.setSpacing(10)
 
-        # Core settings
         grp1 = QGroupBox("TUN CORE"); g1 = QVBoxLayout(grp1); g1.setSpacing(8)
         r1 = QHBoxLayout()
         r1.addWidget(QLabel("Stack:"))
@@ -714,7 +673,6 @@ class SettingsDialog(QDialog):
             g1.addWidget(cb)
         lay.addWidget(grp1)
 
-        # Route exclude
         grp2 = QGroupBox("ROUTE EXCLUDE ADDRESS"); g2 = QVBoxLayout(grp2); g2.setSpacing(6)
         self.cb_auto_gw = QCheckBox("Автоматически добавлять шлюз (/32) при запуске")
         self.cb_auto_gw.setChecked(self._s.get("route_exclude_auto_gw", True))
@@ -742,7 +700,6 @@ class SettingsDialog(QDialog):
         lay.addWidget(grp2); lay.addStretch()
         return w
 
-    # ── PAGE 3: SERVICE ───────────────────────────────────────────────────────
     def _page_service(self) -> QWidget:
         w = QWidget(); lay = QVBoxLayout(w)
         lay.setContentsMargins(16, 12, 16, 8); lay.setSpacing(10)
@@ -754,6 +711,22 @@ class SettingsDialog(QDialog):
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#64748b;font-family:monospace;font-size:9px;")
         gl.addWidget(hint)
+
+        port_row = QHBoxLayout(); port_row.setSpacing(6)
+        port_row.addWidget(QLabel("HTTP API порт:"))
+        self.le_svc_port = QLineEdit(str(self._s.get("service_port", 33212)))
+        self.le_svc_port.setStyleSheet(input_style())
+        self.le_svc_port.setFixedWidth(80)
+        port_row.addWidget(self.le_svc_port)
+        port_row.addStretch()
+        gl.addLayout(port_row)
+        port_hint = QLabel(
+            "Изменится после сохранения и переустановки/перезапуска сервиса "
+            "(Delete Service → Install Service). Не должен совпадать с другими "
+            "локальными портами на машине.")
+        port_hint.setWordWrap(True)
+        port_hint.setStyleSheet("color:#475569;font-family:monospace;font-size:9px;")
+        gl.addWidget(port_hint)
 
         self.task_status = QLabel("")
         self.task_status.setStyleSheet("font-family:monospace;font-size:9px;")
@@ -772,7 +745,6 @@ class SettingsDialog(QDialog):
         lay.addWidget(grp); lay.addStretch()
         return w
 
-    # ── Helpers: exclude address ──────────────────────────────────────────────
     def _excl_add(self):
         val = self.le_excl.text().strip()
         if not val: return
@@ -800,7 +772,6 @@ class SettingsDialog(QDialog):
         else:
             QMessageBox.information(self, "Auto GW", f"Уже в списке: {cidr}")
 
-    # ── Helpers: service ─────────────────────────────────────────────────────
     def _refresh_task_status(self):
         if service_installed():
             self.task_status.setText("● Статус: УСТАНОВЛЕН")
@@ -829,7 +800,6 @@ class SettingsDialog(QDialog):
         if ok: QMessageBox.information(self, "Готово", "Сервис удалён.")
         else:  QMessageBox.warning(self, "Ошибка", f"Не удалось:\n{msg}")
 
-    # ── Save ──────────────────────────────────────────────────────────────────
     def _save(self):
         set_autostart(self.cb_auto.isChecked())
         self._s["silent_start"]    = self.cb_silent.isChecked()
@@ -846,234 +816,19 @@ class SettingsDialog(QDialog):
         self._s["route_exclude_address"] = [
             self.excl_list.item(i).text() for i in range(self.excl_list.count())]
 
-        save_settings(self._s)
-        self.accept()
-
-
-
-        # ── APP SETTINGS ──────────────────────────────────────────────────────
-        grp = QGroupBox("APP SETTINGS")
-        grp_lay = QVBoxLayout(grp); grp_lay.setSpacing(8)
-
-        self.cb_auto    = QCheckBox("Автостарт  (запуск при старте Windows)")
-        self.cb_silent  = QCheckBox("Тихий старт  (открывать сразу в трее)")
-        self.cb_restore = QCheckBox("Восстанавливать сессию при старте")
-        self.cb_auto.setChecked(get_autostart())
-        self.cb_silent.setChecked(self._s.get("silent_start", False))
-        self.cb_restore.setChecked(self._s.get("restore_session", True))
-        grp_lay.addWidget(self.cb_auto)
-        grp_lay.addWidget(self.cb_silent)
-        grp_lay.addWidget(self.cb_restore)
-
-        hint1 = QLabel("Тихий старт + восстановление сессии = автоподключение при загрузке.")
-        hint1.setStyleSheet("color:#475569;font-family:monospace;font-size:9px;")
-        grp_lay.addWidget(hint1)
-        lay.addWidget(grp)
-
-        # ── ADMIN SERVICE ─────────────────────────────────────────────────────
-        grp2 = QGroupBox("ADMIN SERVICE  (Windows Service)")
-        grp2_lay = QVBoxLayout(grp2); grp2_lay.setSpacing(8)
-
-        hint2 = QLabel(
-            "Устанавливает системный сервис. "
-            "После установки TUN-режим запускается БЕЗ UAC-запроса.")
-        hint2.setStyleSheet("color:#64748b;font-family:monospace;font-size:9px;")
-        grp2_lay.addWidget(hint2)
-
-        self.task_status = QLabel("")
-        self.task_status.setStyleSheet("font-family:monospace;font-size:9px;")
-        self._refresh_task_status()
-        grp2_lay.addWidget(self.task_status)
-
-        btn_row2 = QHBoxLayout(); btn_row2.setSpacing(6)
-        self.b_install = QPushButton("⚡ Install Service")
-        self.b_delete  = QPushButton("✕ Delete Service")
-        self.b_install.setStyleSheet(btn_style(accent=True))
-        self.b_delete.setStyleSheet(btn_style(danger=True))
-        self.b_install.clicked.connect(self._install_task)
-        self.b_delete.clicked.connect(self._delete_task)
-        btn_row2.addWidget(self.b_install); btn_row2.addWidget(self.b_delete)
-        grp2_lay.addLayout(btn_row2)
-        lay.addWidget(grp2)
-
-        # ── TUN & NETWORK SETTINGS ────────────────────────────────────────────
-        grp3 = QGroupBox("TUN & NETWORK SETTINGS")
-        grp3_lay = QVBoxLayout(grp3); grp3_lay.setSpacing(8)
-
-        row_stack = QHBoxLayout()
-        row_stack.addWidget(QLabel("TUN Stack:"))
-        self.cb_stack = QComboBox()
-        self.cb_stack.addItems(["system", "gvisor", "lwip"])
-        self.cb_stack.setCurrentText(self._s.get("tun_stack", "system"))
-        self.cb_stack.setStyleSheet(input_style())
-        row_stack.addWidget(self.cb_stack)
-        grp3_lay.addLayout(row_stack)
-
-        row_mtu = QHBoxLayout()
-        row_mtu.addWidget(QLabel("MTU:"))
-        self.le_mtu = QLineEdit()
-        self.le_mtu.setText(str(self._s.get("tun_mtu", 1500)))
-        self.le_mtu.setStyleSheet(input_style())
-        row_mtu.addWidget(self.le_mtu)
-        grp3_lay.addLayout(row_mtu)
-
-        self.cb_auto_route   = QCheckBox("Auto Route")
-        self.cb_strict_route = QCheckBox("Strict Route")
-        self.cb_sniff        = QCheckBox("Включить Sniff (PROXY/TUN)")
-        self.cb_auto_route.setChecked(self._s.get("tun_auto_route", True))
-        self.cb_strict_route.setChecked(self._s.get("tun_strict_route", True))
-        self.cb_sniff.setChecked(self._s.get("sniff", True))
-        grp3_lay.addWidget(self.cb_auto_route)
-        grp3_lay.addWidget(self.cb_strict_route)
-        grp3_lay.addWidget(self.cb_sniff)
-
-        # ── ROUTE EXCLUDE ADDRESS ─────────────────────────────────────────────
-        excl_lbl = QLabel("ROUTE EXCLUDE ADDRESS")
-        excl_lbl.setStyleSheet(
-            "color:#7c3aed;font-family:monospace;font-size:9px;"
-            "font-weight:bold;margin-top:4px;")
-        grp3_lay.addWidget(excl_lbl)
-
-        self.cb_auto_gw = QCheckBox("Автоматически добавлять дефолтный шлюз (/32)")
-        self.cb_auto_gw.setChecked(self._s.get("route_exclude_auto_gw", True))
-        grp3_lay.addWidget(self.cb_auto_gw)
-
-        self.excl_list = QListWidget()
-        self.excl_list.setFixedHeight(82)
-        for cidr in self._s.get("route_exclude_address",
-                                 ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]):
-            self.excl_list.addItem(cidr)
-        grp3_lay.addWidget(self.excl_list)
-
-        excl_row = QHBoxLayout(); excl_row.setSpacing(6)
-        self.le_excl = QLineEdit()
-        self.le_excl.setPlaceholderText("192.168.1.0/24 или 10.0.0.1/32")
-        self.le_excl.setStyleSheet(input_style())
-        excl_row.addWidget(self.le_excl, 1)
-        b_excl_add = QPushButton("+ ADD")
-        b_excl_del = QPushButton("✕ DEL")
-        b_excl_gw  = QPushButton("⚡ AUTO GW")
-        b_excl_add.setStyleSheet(btn_style(accent=True))
-        b_excl_del.setStyleSheet(btn_style(danger=True))
-        b_excl_gw.setStyleSheet(btn_style())
-        b_excl_add.setFixedWidth(62); b_excl_del.setFixedWidth(62); b_excl_gw.setFixedWidth(82)
-        b_excl_add.clicked.connect(self._excl_add)
-        b_excl_del.clicked.connect(self._excl_del)
-        b_excl_gw.clicked.connect(self._excl_detect_gw)
-        excl_row.addWidget(b_excl_add); excl_row.addWidget(b_excl_del); excl_row.addWidget(b_excl_gw)
-        grp3_lay.addLayout(excl_row)
-
-        hint3 = QLabel("Эти адреса не идут через TUN — шлюз и LAN должны быть здесь всегда.")
-        hint3.setStyleSheet("color:#475569;font-family:monospace;font-size:9px;")
-        grp3_lay.addWidget(hint3)
-
-        lay.addWidget(grp3)
-        lay.addStretch()
-
-        row = QHBoxLayout()
-        b_cancel = QPushButton("Отмена"); b_cancel.setStyleSheet(btn_style())
-        b_save   = QPushButton("Сохранить"); b_save.setStyleSheet(btn_style(accent=True))
-        b_cancel.clicked.connect(self.reject)
-        b_save.clicked.connect(self._save)
-        row.addWidget(b_cancel); row.addWidget(b_save)
-        lay.addLayout(row)
-
-    # ── Route exclude helpers ─────────────────────────────────────────────────
-    def _excl_add(self):
-        val = self.le_excl.text().strip()
-        if not val:
-            return
-        if not re.match(r'^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$', val):
-            QMessageBox.warning(self, "Ошибка", f"Неверный CIDR: {val}\nПример: 192.168.1.0/24")
-            return
-        existing = [self.excl_list.item(i).text() for i in range(self.excl_list.count())]
-        if val not in existing:
-            self.excl_list.addItem(val)
-        self.le_excl.clear()
-
-    def _excl_del(self):
-        for item in self.excl_list.selectedItems():
-            self.excl_list.takeItem(self.excl_list.row(item))
-
-    def _excl_detect_gw(self):
         try:
-            from builder import get_default_gateway
-            gw = get_default_gateway()
-        except Exception:
-            gw = None
-        if not gw:
-            QMessageBox.information(self, "Auto GW",
-                "Шлюз не определён.\nПроверь подключение к сети.")
-            return
-        cidr = f"{gw}/32"
-        existing = [self.excl_list.item(i).text() for i in range(self.excl_list.count())]
-        if cidr not in existing:
-            self.excl_list.addItem(cidr)
-            QMessageBox.information(self, "Auto GW", f"Шлюз добавлен: {cidr}")
-        else:
-            QMessageBox.information(self, "Auto GW", f"Шлюз уже в списке: {cidr}")
-
-    def _refresh_task_status(self):
-        if service_installed():
-            self.task_status.setText("● Статус: УСТАНОВЛЕН")
-            self.task_status.setStyleSheet("color:#10b981;font-family:monospace;font-size:9px;")
-        else:
-            self.task_status.setText("○ Статус: не установлен")
-            self.task_status.setStyleSheet("color:#64748b;font-family:monospace;font-size:9px;")
-
-    def _install_task(self):
-        self.b_install.setEnabled(False)
-        self.task_status.setText("Устанавливаем... (потребуется UAC)")
-        self.task_status.setStyleSheet("color:#f59e0b;font-family:monospace;font-size:9px;")
-        QApplication.processEvents()
-        
-        ok, msg = install_service()
-        self._refresh_task_status()
-        self.b_install.setEnabled(True)
-        if ok:
-            QMessageBox.information(self, "Готово", "Сервис установлен!\n\nТеперь приложение будет запускать TUN без UAC-запроса.")
-        else:
-            QMessageBox.warning(self, "Ошибка", f"Не удалось установить:\n{msg}")
-
-    def _delete_task(self):
-        self.b_delete.setEnabled(False)
-        self.task_status.setText("Удаляем... (потребуется UAC)")
-        self.task_status.setStyleSheet("color:#f59e0b;font-family:monospace;font-size:9px;")
-        QApplication.processEvents()
-        
-        ok, msg = uninstall_service()
-        self._refresh_task_status()
-        self.b_delete.setEnabled(True)
-        
-        if ok:
-            QMessageBox.information(self, "Готово", "Сервис удалён.")
-        else:
-            QMessageBox.warning(self, "Ошибка", f"Не удалось удалить:\n{msg}")
-
-    def _save(self):
-        set_autostart(self.cb_auto.isChecked())
-        self._s["silent_start"]    = self.cb_silent.isChecked()
-        self._s["restore_session"] = self.cb_restore.isChecked()
-
-        self._s["tun_stack"]     = self.cb_stack.currentText()
-        try:
-            self._s["tun_mtu"]   = int(self.le_mtu.text())
+            port = int(self.le_svc_port.text())
+            if not (1024 <= port <= 65535):
+                raise ValueError
+            self._s["service_port"] = port
         except ValueError:
-            self._s["tun_mtu"]   = 1500
-        self._s["tun_auto_route"]   = self.cb_auto_route.isChecked()
-        self._s["tun_strict_route"] = self.cb_strict_route.isChecked()
-        self._s["sniff"]            = self.cb_sniff.isChecked()
-
-        self._s["route_exclude_auto_gw"] = self.cb_auto_gw.isChecked()
-        self._s["route_exclude_address"] = [
-            self.excl_list.item(i).text()
-            for i in range(self.excl_list.count())
-        ]
+            QMessageBox.warning(self, "Ошибка",
+                "Порт сервиса должен быть числом 1024–65535.")
+            return
 
         save_settings(self._s)
         self.accept()
 
-# ── ПРЕСЕТЫ И РЕДАКТОР ПРАВИЛ ────────────────────────────────────────────────
 DEFAULT_PRESETS = {
     "🌐 Global — всё через прокси": [
         {"type":"MATCH","value":"","action":"proxy"}
@@ -1126,6 +881,27 @@ def save_presets(p: dict):
     with open(PRESETS_FILE, "w", encoding="utf-8") as f:
         json.dump(p, f, indent=2, ensure_ascii=False)
 
+class _RuleTable(QTableWidget):
+    
+    rowsReordered = pyqtSignal(int, int)
+
+    def dropEvent(self, event):
+        if event.source() is not self:
+            event.ignore()
+            return
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        sel = sorted({i.row() for i in self.selectedIndexes()})
+        if not sel:
+            event.ignore()
+            return
+        from_row = sel[0]
+        target = self.indexAt(pos).row()
+        if target == -1:
+            target = self.rowCount() - 1
+        event.ignore()
+        if target != from_row:
+            self.rowsReordered.emit(from_row, target)
+
 class RulesDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1139,32 +915,38 @@ class RulesDialog(QDialog):
         lbl_p = QLabel("Пресет:")
         lbl_p.setStyleSheet("color:#7c3aed;font-family:monospace;font-size:10px;font-weight:bold;")
         preset_row.addWidget(lbl_p)
-        
+
         self.preset_cb = QComboBox()
         self.preset_cb.addItems(list(self._presets.keys()))
         self.preset_cb.setStyleSheet(input_style())
         preset_row.addWidget(self.preset_cb, 1)
-        
+
         b_load = QPushButton("Загрузить"); b_load.setStyleSheet(btn_style())
         b_save_p = QPushButton("💾 Сохранить"); b_save_p.setStyleSheet(btn_style(accent=True))
         b_del_p = QPushButton("🗑"); b_del_p.setStyleSheet(btn_style(danger=True))
-        
+
         b_load.clicked.connect(self._load_preset)
         b_save_p.clicked.connect(self._save_preset)
         b_del_p.clicked.connect(self._delete_preset)
-        
+
         preset_row.addWidget(b_load)
         preset_row.addWidget(b_save_p)
         preset_row.addWidget(b_del_p)
         lay.addLayout(preset_row)
 
-        self.table = QTableWidget(0,3)
+        self.table = _RuleTable(0,3)
         self.table.setHorizontalHeaderLabels(["TYPE","VALUE","ACTION"])
         self.table.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeMode.Stretch)
         self.table.setColumnWidth(0,160); self.table.setColumnWidth(2,80)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setStyleSheet(table_style())
+        self.table.setDragEnabled(True)
+        self.table.setAcceptDrops(True)
+        self.table.setDropIndicatorShown(True)
+        self.table.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.table.rowsReordered.connect(self._reorder_rule)
         lay.addWidget(self.table)
 
         er = QHBoxLayout(); er.setSpacing(6)
@@ -1176,9 +958,12 @@ class RulesDialog(QDialog):
         er.addWidget(self.e_type,2); er.addWidget(self.e_value,3); er.addWidget(self.e_action,1)
         lay.addLayout(er)
 
+        hint_drag = QLabel("↕ Перетаскивай строки мышью, чтобы изменить порядок")
+        hint_drag.setStyleSheet("color:#475569;font-family:monospace;font-size:9px;")
+        lay.addWidget(hint_drag)
+
         br = QHBoxLayout(); br.setSpacing(6)
         btns = [("+ ADD",self._add,False),("✕ DEL",self._delete,False),
-                ("▲ UP",self._up,False),("▼ DOWN",self._down,False),
                 ("💾 SAVE & CLOSE",self._save,True)]
         for label,slot,acc in btns:
             b=QPushButton(label); b.clicked.connect(slot)
@@ -1267,21 +1052,15 @@ class RulesDialog(QDialog):
         for r in sorted(self._sel_rows(),reverse=True): del self._rules[r]
         self._refresh()
 
-    def _up(self):
-        rows=self._sel_rows()
-        if not rows or rows[0]==0: return
-        for r in rows: self._rules[r-1],self._rules[r]=self._rules[r],self._rules[r-1]
+    def _reorder_rule(self, from_row: int, to_row: int):
+        
+        if not (0 <= from_row < len(self._rules)):
+            return
+        rule = self._rules.pop(from_row)
+        to_row = max(0, min(to_row, len(self._rules)))
+        self._rules.insert(to_row, rule)
         self._refresh()
-        for r in rows:
-            for c in range(3): self.table.item(r-1,c).setSelected(True)
-
-    def _down(self):
-        rows=self._sel_rows()
-        if not rows or rows[-1]>=len(self._rules)-1: return
-        for r in reversed(rows): self._rules[r+1],self._rules[r]=self._rules[r],self._rules[r+1]
-        self._refresh()
-        for r in rows:
-            for c in range(3): self.table.item(r+1,c).setSelected(True)
+        self.table.selectRow(to_row)
 
     def _save(self):
         lines=[]
@@ -1291,7 +1070,6 @@ class RulesDialog(QDialog):
         with open(RULES_FILE,"w",encoding="utf-8") as f: f.write("\n".join(lines)+"\n")
         self.accept()
 
-# ── ПОТОК СБОРА СОЕДИНЕНИЙ ────────────────────────────────────────────────────
 class ConnectionsWorker(QThread):
     updated = pyqtSignal(list)
     def __init__(self):
@@ -1336,7 +1114,6 @@ class ConnectionsWorker(QThread):
                     key=lambda r:(r["status"]=="CLOSED",r["first_seen"]))
         self.updated.emit(rows)
 
-# ── ДИАЛОГ СОЕДИНЕНИЙ ─────────────────────────────────────────────────────────
 class ConnectionsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1437,15 +1214,9 @@ class ConnectionsDialog(QDialog):
 
     def closeEvent(self,_): self._worker.stop()
 
-# ── ПОТОК И ПАНЕЛЬ ЛОГОВ ──────────────────────────────────────────────────────
 class LogTailThread(QThread):
-    """
-    Следит за ДВУМЯ лог-файлами одновременно (sb.log и xray.log) и
-    эмиттит строки с тегом источника — нужно для фильтра XRAY/SING-BOX/CRYSTALL
-    в LogPanel. Раньше отслеживался только sb.log, из-за чего в dual-core
-    режиме (sing-box TUN + Xray SOCKS5-бэкенд) лог Xray просто не показывался.
-    """
-    new_lines = pyqtSignal(list)   # список (source:str, line:str)
+    
+    new_lines = pyqtSignal(list)
 
     def __init__(self):
         super().__init__()
@@ -1463,8 +1234,6 @@ class LogTailThread(QThread):
                     if not os.path.exists(path):
                         continue
                     size = os.path.getsize(path)
-                    # Файл стал короче (очистили логи) — сбрасываем позицию,
-                    # иначе seek() уйдёт за конец и ничего не прочитается.
                     if self._pos[path] > size:
                         self._pos[path] = 0
                     with open(path, encoding="utf-8", errors="replace") as f:
@@ -1487,18 +1256,17 @@ class LogPanel(QWidget):
         lay=QVBoxLayout(self); lay.setContentsMargins(4,2,4,4); lay.setSpacing(3)
 
         tb=QHBoxLayout(); tb.setSpacing(6)
-        lbl=QLabel("LOGS")
-        lbl.setStyleSheet("color:#7c3aed;font-family:monospace;font-size:9px;font-weight:bold;")
-        tb.addWidget(lbl)
+        self.tb_layout = tb
+        self.lbl=QLabel("LOGS")
+        self.lbl.setStyleSheet("color:#7c3aed;font-family:monospace;font-size:9px;font-weight:bold;")
+        tb.addWidget(self.lbl)
 
-        # Фильтр по уровню (как и раньше)
         self.level=QComboBox(); self.level.addItems(["ALL","INFO","WARN","ERROR"])
         self.level.setFixedWidth(64)
         self.level.setStyleSheet(input_style())
         self.level.currentTextChanged.connect(self._refilter)
         tb.addWidget(self.level)
 
-        # Фильтр по источнику: XRAY / SING-BOX / CRYSTALL (лог самого приложения)
         self.source=QComboBox(); self.source.addItems(["ALL","SING-BOX","XRAY","CRYSTALL"])
         self.source.setFixedWidth(82)
         self.source.setStyleSheet(input_style())
@@ -1530,21 +1298,20 @@ class LogPanel(QWidget):
             "font-family:monospace;font-size:9px;padding:4px;}")
         lay.addWidget(self.text)
 
-        # Каждая запись: {"source": "SING-BOX"|"XRAY"|"CRYSTALL", "level": "INFO"|"WARN"|"ERROR", "text": str}
         self._all_lines=[]; self._visible=True
         self._tail=LogTailThread()
         self._tail.new_lines.connect(self._on_lines)
         self._tail.start()
 
     def append(self, msg):
-        """Лог самого приложения (CRYSTALL) — READY (имя инбаунда) и подобное."""
+        
         entry = {"source": "CRYSTALL", "level": "INFO", "text": msg}
         self._all_lines.append(entry)
         if self._visible and self._matches(entry):
             self._put(f"<span style='color:#a78bfa'>[CRYSTALL] › {msg}</span>")
 
     def _on_lines(self, lines):
-        """lines: список (source, raw_line) от LogTailThread."""
+        
         for source, raw in lines:
             raw=strip_ansi(raw).rstrip()
             if not raw: continue
@@ -1577,11 +1344,7 @@ class LogPanel(QWidget):
                 self._put(self._color(entry))
 
     def _clear_logs(self):
-        """
-        Стирает логи на диске (sb.log, xray.log) и в памяти панели.
-        Сбрасывает позицию tail-потока, иначе он попытается прочитать
-        с офсета, который теперь за пределами усечённого файла.
-        """
+        
         try:
             from runner import clear_logs
             clear_logs()
@@ -1594,233 +1357,515 @@ class LogPanel(QWidget):
 
     def _toggle(self):
         self._visible=not self._visible
-        self.text.setVisible(self._visible)
-        self.b_toggle.setText("▼ HIDE" if self._visible else "▲ SHOW")
+
+        for w in (self.lbl, self.level, self.source, self.b_conn,
+                  self.b_clear, self.text):
+            w.setVisible(self._visible)
+
+        if self._visible:
+            if self.b_toggle.parent() is not self:
+                self.b_toggle.setParent(self)
+            if self.tb_layout.indexOf(self.b_toggle) == -1:
+                self.tb_layout.addWidget(self.b_toggle)
+            self.b_toggle.setText("▼ HIDE")
+            self.b_toggle.show()
+        else:
+            self.tb_layout.removeWidget(self.b_toggle)
+            top = self.window()
+            self.b_toggle.setParent(top)
+            self.b_toggle.setText("▲ SHOW")
+            self.b_toggle.adjustSize()
+            self.b_toggle.move(top.width()  - self.b_toggle.width()  - 12,
+                                top.height() - self.b_toggle.height() - 12)
+            self.b_toggle.show()
+            self.b_toggle.raise_()
+
     def reset_tail(self): self._tail.reset()
     def stop(self): self._tail.stop()
 
-# ── МЕНЕДЖЕР КЛАСТЕРОВ ────────────────────────────────────────────────────────
-class ProfileDialog(QDialog):
-    def __init__(self, runner=None, active_mode="proxy", parent=None):
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    hex_color = (hex_color or "#7c3aed").lstrip("#")
+    if len(hex_color) != 6:
+        hex_color = "7c3aed"
+    r = int(hex_color[0:2], 16); g = int(hex_color[2:4], 16); b = int(hex_color[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+def _tile_btn_style() -> str:
+    return (
+        "QPushButton{background:transparent;border:none;color:#94a3b8;font-size:11px;}"
+        "QPushButton:hover{color:#e2e8f0;}"
+        "QPushButton:pressed{color:#7c3aed;}"
+    )
+
+class TileButton(QFrame):
+    
+    clicked = pyqtSignal()
+
+    def __init__(self, w: int = 148, h: int = 104, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("CLUSTER MANAGEMENT"); self.setFixedSize(660,540)
+        self.setFixedSize(w, h)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(e)
+
+class AddTile(TileButton):
+    
+    def __init__(self, parent=None):
+        super().__init__(parent=parent)
+        self.setStyleSheet(
+            "QFrame{background:transparent;border:2px dashed #475569;border-radius:12px;}"
+            "QFrame:hover{border-color:#7c3aed;}"
+        )
+        lay = QVBoxLayout(self)
+        plus = QLabel("+")
+        plus.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        plus.setStyleSheet("color:#475569;font-size:34px;border:none;background:transparent;")
+        lay.addWidget(plus)
+
+class ClusterTile(TileButton):
+    
+    editRequested = pyqtSignal()
+    refreshRequested = pyqtSignal()
+
+    def __init__(self, data: dict, path: str, parent=None):
+        super().__init__(parent=parent)
+        self.path = path
+        self.data = data
+        color = data.get("color") or "#7c3aed"
+        bg = _hex_to_rgba(color, 0.14)
+        self.setStyleSheet(
+            f"QFrame{{background:{bg};border:1.5px solid {color};border-radius:12px;}}"
+            f"QFrame:hover{{background:{_hex_to_rgba(color, 0.22)};}}"
+        )
+        lay = QVBoxLayout(self); lay.setContentsMargins(10, 6, 6, 8); lay.setSpacing(2)
+
+        top = QHBoxLayout(); top.setSpacing(0)
+        top.addStretch()
+        if data.get("source_url"):
+            b_ref = QPushButton("🔄"); b_ref.setFixedSize(22, 22)
+            b_ref.setToolTip("Обновить подписку (с обновлением IP)")
+            b_ref.setStyleSheet(_tile_btn_style())
+            b_ref.clicked.connect(lambda: self.refreshRequested.emit())
+            top.addWidget(b_ref)
+        b_edit = QPushButton("✎"); b_edit.setFixedSize(22, 22)
+        b_edit.setToolTip("Редактировать кластер")
+        b_edit.setStyleSheet(_tile_btn_style())
+        b_edit.clicked.connect(lambda: self.editRequested.emit())
+        top.addWidget(b_edit)
+        lay.addLayout(top)
+
+        lay.addStretch()
+        title = QLabel(data.get("name", "?"))
+        title.setWordWrap(True)
+        title.setStyleSheet(
+            f"color:{color};font-family:monospace;font-weight:bold;"
+            f"font-size:12px;border:none;background:transparent;")
+        lay.addWidget(title)
+
+        n = len(data.get("profiles", []))
+        meta = f"{n} inbound{'s' if n != 1 else ''}"
+        if data.get("source_url"):
+            meta += "  ·  SUB"
+        sub = QLabel(meta)
+        sub.setStyleSheet("color:#94a3b8;font-family:monospace;font-size:8px;border:none;background:transparent;")
+        lay.addWidget(sub)
+
+class InboundTile(TileButton):
+    
+    editRequested = pyqtSignal()
+    deleteRequested = pyqtSignal()
+
+    def __init__(self, profile: dict, index: int, parent=None):
+        super().__init__(parent=parent)
+        self.index = index
+        self.profile = profile
+        is_custom = bool(profile.get("custom"))
+        accent = "#10b981" if is_custom else "#7c3aed"
+        self.setStyleSheet(
+            f"QFrame{{background:#161427;border:1.5px solid {accent};border-radius:12px;}}"
+            f"QFrame:hover{{background:#1c1936;}}"
+        )
+        lay = QVBoxLayout(self); lay.setContentsMargins(10, 6, 6, 8); lay.setSpacing(2)
+
+        top = QHBoxLayout(); top.setSpacing(0)
+        proto = profile.get("protocol", "hysteria2")
+        badge = QLabel("VLESS" if proto == "vless" else "HY2")
+        badge.setStyleSheet(
+            f"color:{accent};font-family:monospace;font-size:8px;"
+            f"font-weight:bold;border:none;background:transparent;")
+        top.addWidget(badge)
+        if is_custom:
+            cb = QLabel("•custom")
+            cb.setStyleSheet("color:#10b981;font-family:monospace;font-size:8px;border:none;background:transparent;")
+            top.addWidget(cb)
+        top.addStretch()
+        b_edit = QPushButton("✎"); b_edit.setFixedSize(20, 20)
+        b_edit.setToolTip("Переименовать")
+        b_edit.setStyleSheet(_tile_btn_style())
+        b_edit.clicked.connect(lambda: self.editRequested.emit())
+        b_del = QPushButton("🗑"); b_del.setFixedSize(20, 20)
+        b_del.setToolTip("Удалить")
+        b_del.setStyleSheet(_tile_btn_style())
+        b_del.clicked.connect(lambda: self.deleteRequested.emit())
+        top.addWidget(b_edit); top.addWidget(b_del)
+        lay.addLayout(top)
+
+        lay.addStretch()
+        title = QLabel(profile.get("name", "Node"))
+        title.setWordWrap(True)
+        title.setStyleSheet(
+            "color:#e2e8f0;font-family:monospace;font-weight:bold;"
+            "font-size:11px;border:none;background:transparent;")
+        lay.addWidget(title)
+
+        sub = QLabel(f"{profile.get('host','')}:{profile.get('port_hopping') or profile.get('port','')}")
+        if profile.get("port_hopping"):
+            sub.setToolTip("Port Hopping включён")
+        sub.setStyleSheet("color:#64748b;font-family:monospace;font-size:8px;border:none;background:transparent;")
+        lay.addWidget(sub)
+
+        self.ping_label = QLabel("")
+        self.ping_label.setStyleSheet("font-family:monospace;font-size:9px;border:none;background:transparent;")
+        lay.addWidget(self.ping_label)
+
+    def set_ping(self, text: str, color: str):
+        self.ping_label.setText(text)
+        self.ping_label.setStyleSheet(
+            f"color:{color};font-family:monospace;font-size:9px;border:none;background:transparent;")
+
+class ClusterEditDialog(QDialog):
+    def __init__(self, data: dict, path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("EDIT CLUSTER"); self.setFixedSize(380, 320)
         self.setStyleSheet(dialog_style())
-        self.selected_data=None; self.ping_threads=[]
-        self._runner=runner; self._active_mode=active_mode
-        lay=QVBoxLayout(self); lay.setSpacing(8)
+        self.path = path
+        lay = QVBoxLayout(self); lay.setSpacing(8)
 
-        self.tree=QTreeWidget(); self.tree.setHeaderLabels(["ОБЪЕКТ","АДРЕС","PING"])
-        self.tree.setColumnWidth(0,260); self.tree.setColumnWidth(1,200)
-        self.tree.setStyleSheet(table_style())
-        lay.addWidget(self.tree)
+        lay.addWidget(QLabel("Имя:"))
+        self.le_name = QLineEdit(data.get("name", ""))
+        self.le_name.setStyleSheet(input_style())
+        lay.addWidget(self.le_name)
 
-        ctrls=QHBoxLayout(); ctrls.setSpacing(6)
-        for label,slot,acc in [("+ CLUSTER",self._add_cluster,False),
-                                ("+ SUBSC",self._import_sub,False),
-                                ("+ LINK",self._add_link,False),
-                                ("PING ALL",self._ping,False),
-                                ("DELETE",self._del,True)]:
-            b=QPushButton(label); b.clicked.connect(slot)
-            b.setStyleSheet(btn_style(danger=acc))
-            ctrls.addWidget(b)
-        lay.addLayout(ctrls)
+        lay.addWidget(QLabel("Цвет:"))
+        color_row = QHBoxLayout(); color_row.setSpacing(6)
+        self._color = data.get("color") or cm.DEFAULT_PALETTE[0]
+        self._swatches = []
+        for c in cm.DEFAULT_PALETTE:
+            b = QPushButton()
+            b.setFixedSize(26, 26)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setProperty("swatch_color", c)
+            b.clicked.connect(lambda _checked=False, c=c: self._pick_color(c))
+            color_row.addWidget(b)
+            self._swatches.append(b)
+        color_row.addStretch()
+        lay.addLayout(color_row)
+        self._refresh_swatches()
 
-        ctrls2=QHBoxLayout(); ctrls2.setSpacing(6)
-        self.b_refresh_ip=QPushButton("🔄 Обновить IP")
-        self.b_update_sub=QPushButton("⬇ Обновить подписки")
-        self.b_refresh_ip.setStyleSheet(btn_style())
-        self.b_update_sub.setStyleSheet(btn_style())
-        self.b_refresh_ip.clicked.connect(self._refresh_ip)
-        self.b_update_sub.clicked.connect(self._update_sub)
-        ctrls2.addWidget(self.b_refresh_ip); ctrls2.addWidget(self.b_update_sub)
-        ctrls2.addStretch()
-        lay.addLayout(ctrls2)
+        lay.addWidget(QLabel("Ссылка на подписку (пусто = без подписки):"))
+        self.le_url = QLineEdit(data.get("source_url", ""))
+        self.le_url.setPlaceholderText("https://...")
+        self.le_url.setStyleSheet(input_style())
+        lay.addWidget(self.le_url)
 
-        self.op_status=QLabel("")
-        self.op_status.setStyleSheet("color:#64748b;font-family:monospace;font-size:9px;")
-        lay.addWidget(self.op_status)
+        lay.addStretch()
+        row = QHBoxLayout(); row.setSpacing(6)
+        b_del = QPushButton("🗑 Удалить"); b_del.setStyleSheet(btn_style(danger=True))
+        b_cancel = QPushButton("Отмена"); b_cancel.setStyleSheet(btn_style())
+        b_save = QPushButton("Сохранить"); b_save.setStyleSheet(btn_style(accent=True))
+        b_del.clicked.connect(self._delete)
+        b_cancel.clicked.connect(self.reject)
+        b_save.clicked.connect(self._save)
+        row.addWidget(b_del); row.addStretch(); row.addWidget(b_cancel); row.addWidget(b_save)
+        lay.addLayout(row)
 
-        self.ping_hint=QLabel("")
+    def _pick_color(self, c: str):
+        self._color = c
+        self._refresh_swatches()
+
+    def _refresh_swatches(self):
+        for b in self._swatches:
+            c = b.property("swatch_color")
+            border = "2px solid #a78bfa" if c == self._color else "1px solid #1e293b"
+            b.setStyleSheet(f"QPushButton{{background:{c};border-radius:13px;border:{border};}}")
+
+    def _save(self):
+        name = self.le_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Ошибка", "Имя не может быть пустым.")
+            return
+        url = self.le_url.text().strip()
+        cm.update_cluster_meta(
+            self.path, name=name, color=self._color,
+            source_url=url if url else None, clear_source_url=not url)
+        self.accept()
+
+    def _delete(self):
+        if QMessageBox.question(
+                self, "Удалить кластер",
+                f"Удалить кластер «{self.le_name.text()}» со всеми инбаундами?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes:
+            cm.delete_cluster(self.path)
+            self.accept()
+
+class InboundsGridDialog(QDialog):
+    def __init__(self, path: str, data: dict, runner=None, active_mode="proxy", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"INBOUNDS — {data.get('name','?')}"); self.setFixedSize(660, 540)
+        self.setStyleSheet(dialog_style())
+        self.path = path
+        self.selected_data = None
+        self._runner = runner; self._active_mode = active_mode
+        self.ping_threads = []
+        self.tiles = []
+        lay = QVBoxLayout(self); lay.setSpacing(8)
+
+        top = QHBoxLayout()
+        title = QLabel(f"⬢ {data.get('name','?')}")
+        color = data.get("color") or "#7c3aed"
+        title.setStyleSheet(f"color:{color};font-family:monospace;font-weight:bold;font-size:13px;")
+        top.addWidget(title); top.addStretch()
+        self.b_ping = QPushButton("📶 PING ALL"); self.b_ping.setStyleSheet(btn_style())
+        self.b_ping.clicked.connect(self._ping_all)
+        top.addWidget(self.b_ping)
+        b_back = QPushButton("← Назад"); b_back.setStyleSheet(btn_style())
+        b_back.clicked.connect(self.reject)
+        top.addWidget(b_back)
+        lay.addLayout(top)
+
+        self.ping_hint = QLabel("")
         self.ping_hint.setStyleSheet("color:#475569;font-family:monospace;font-size:9px;")
-        self._update_ping_hint(); lay.addWidget(self.ping_hint)
+        self._update_ping_hint()
+        lay.addWidget(self.ping_hint)
 
-        self.b_sel=QPushButton("CHOOSE PROFILE")
-        self.b_sel.clicked.connect(self._finish)
-        self.b_sel.setStyleSheet(btn_style(accent=True))
-        lay.addWidget(self.b_sel); self._refresh()
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("QScrollArea{border:none;background:#13131f;}")
+        self.scroll.viewport().setStyleSheet("background:#13131f;")
+        self.grid_host = QWidget()
+        self.grid_host.setStyleSheet("background:#13131f;")
+        self.grid = QGridLayout(self.grid_host)
+        self.grid.setSpacing(6)
+        self.grid.setContentsMargins(2, 2, 2, 2)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.scroll.setWidget(self.grid_host)
+        lay.addWidget(self.scroll)
 
-    def _core_running(self): return bool(self._runner and self._runner.proc)
+        self._refresh()
+
+    def _core_running(self) -> bool:
+        return bool(self._runner and self._runner.proc)
 
     def _update_ping_hint(self):
         if self._core_running():
-            m=self._active_mode.upper()
-            txt = f"⚡ URL-пинг через TUN ({m})" if self._active_mode=="tun" \
-                  else f"⚡ URL-пинг через прокси 127.0.0.1:2080 ({m})"
+            m = self._active_mode.upper()
+            txt = (f"⚡ URL-пинг через TUN ({m})" if self._active_mode == "tun"
+                   else f"⚡ URL-пинг через прокси 127.0.0.1:2080 ({m})")
             self.ping_hint.setText(txt)
-            self.ping_hint.setStyleSheet("color:#10b981;font-family:monospace;font-size:9px;")
         else:
             self.ping_hint.setText("⚡ URL-пинг напрямую (ядро не запущено)")
-            self.ping_hint.setStyleSheet("color:#94a3b8;font-family:monospace;font-size:9px;")
 
     def _refresh(self):
-        self.tree.clear()
-        for f in glob.glob(os.path.join(CLUSTERS_DIR,"*.clust")):
-            try:
-                with open(f,encoding='utf-8') as j: d=json.load(j)
-                root=QTreeWidgetItem(self.tree,[d.get('name','?'),d.get('mode','proxy').upper(),""])
-                root.setData(0,Qt.ItemDataRole.UserRole,{"type":"cluster","file":f,"data":d})
-                root.setForeground(0,QBrush(C_ACCENT))
-                for p in d.get('profiles',[]):
-                    ch=QTreeWidgetItem(root,[p.get('name','Node'),p.get('host',''),"—"])
-                    ch.setData(0,Qt.ItemDataRole.UserRole,
-                               {"type":"profile","file":f,"data":p,"mode":d.get('mode','proxy')})
-            except Exception: continue
-        self.tree.expandAll()
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            w = item.widget()
+            if w: w.deleteLater()
+        self.tiles = []
 
-    def _add_cluster(self):
-        name,ok=QInputDialog.getText(self,"New Cluster","Name:")
-        if ok and name:
-            mode,_=QInputDialog.getItem(self,"Mode","Type:",["proxy","tun"],0,False)
-            with open(os.path.join(CLUSTERS_DIR,f"{name}.clust"),'w',encoding='utf-8') as f:
-                json.dump({"name":name,"mode":mode,"profiles":[]},f,indent=2)
-            self._refresh()
-
-    def _import_sub(self):
-        url,ok=QInputDialog.getText(self,"Subscription","URL:")
-        if not (ok and url): return
         try:
-            req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'})
-            with urllib.request.urlopen(req,timeout=10) as resp: raw=resp.read().decode().strip()
-            raw+="="*((4-len(raw)%4)%4)
-            decoded=base64.b64decode(raw).decode()
-            profs=[]
-            for line in decoded.splitlines():
-                line=line.strip()
-                if line.startswith("hysteria2://"):
-                    try: profs.append(parse_hy2(line))
-                    except Exception: pass
-                elif line.startswith("vless://"):
-                    try: profs.append(parse_vless(line))
-                    except Exception: pass
-            if not profs: raise ValueError("Нет hy2/vless ссылок")
-            name=f"Sub_{random.randint(100,999)}"
-            with open(os.path.join(CLUSTERS_DIR,f"{name}.clust"),'w',encoding='utf-8') as f:
-                json.dump({"name":name,"mode":"proxy","source_url":url,"profiles":profs},f,indent=2)
+            data = cm.load_cluster(self.path)
+        except Exception:
+            data = {"profiles": []}
+
+        cols = 3; row = col = 0
+        for idx, profile in enumerate(data.get("profiles", [])):
+            tile = InboundTile(profile, idx)
+            tile.clicked.connect(lambda p=profile: self._select(p))
+            tile.editRequested.connect(lambda i=idx, pr=profile: self._rename(i, pr))
+            tile.deleteRequested.connect(lambda i=idx, pr=profile: self._delete(i, pr))
+            self.grid.addWidget(tile, row, col, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            self.tiles.append(tile)
+            col += 1
+            if col >= cols: col = 0; row += 1
+
+        add_tile = AddTile()
+        add_tile.setToolTip("Добавить инбаунд по ссылке")
+        add_tile.clicked.connect(self._add_inbound)
+        self.grid.addWidget(add_tile, row, col, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+    def _select(self, profile: dict):
+        self.selected_data = {"data": profile, "file": self.path}
+        self.accept()
+
+    def _rename(self, idx: int, profile: dict):
+        new_name, ok = QInputDialog.getText(
+            self, "Переименовать инбаунд", "Имя:", text=profile.get("name", ""))
+        if ok and new_name.strip():
+            cm.rename_inbound(self.path, idx, new_name.strip())
             self._refresh()
-        except Exception as e: QMessageBox.critical(self,"Error",str(e))
 
-    def _add_link(self):
-        """
-        Ручное добавление ОДНОГО инбаунда в выбранный кластер по ссылке
-        hysteria2:// или vless:// — без скачивания подписки целиком.
-        """
-        it = self.tree.currentItem()
-        if not it:
-            QMessageBox.warning(self, "Кластер не выбран",
-                "Сначала выбери кластер (или любой его профиль) в списке.")
-            return
-        # Если выбран профиль (child) — берём родительский кластер
-        cluster_item = it if not it.parent() else it.parent()
-        file_path = cluster_item.data(0, Qt.ItemDataRole.UserRole)["file"]
+    def _delete(self, idx: int, profile: dict):
+        if QMessageBox.question(
+                self, "Удалить инбаунд", f"Удалить «{profile.get('name','?')}»?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes:
+            cm.delete_inbound(self.path, idx)
+            self._refresh()
 
+    def _add_inbound(self):
         link, ok = QInputDialog.getText(
-            self, "Добавить инбаунд",
-            "Ссылка (hysteria2:// или vless://):")
-        if not (ok and link):
+            self, "Добавить инбаунд", "Ссылка (hysteria2:// или vless://):")
+        if not (ok and link.strip()):
             return
-        link = link.strip()
-
         try:
-            if link.startswith(("hysteria2://", "hy2://")):
-                profile = parse_hy2(link)
-            elif link.startswith("vless://"):
-                profile = parse_vless(link)
-            else:
-                raise ValueError("Ссылка должна начинаться с hysteria2:// или vless://")
+            cm.add_manual_inbound(self.path, link.strip())
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка парсинга", str(e))
-            return
+            QMessageBox.critical(self, "Ошибка парсинга", str(e)); return
+        self._refresh()
 
-        try:
-            with open(file_path, encoding="utf-8") as f:
-                cluster_data = json.load(f)
-            cluster_data.setdefault("profiles", []).append(profile)
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(cluster_data, f, indent=2, ensure_ascii=False)
-            self._refresh()
-            self.op_status.setText(f"✓ Добавлен инбаунд: {profile.get('name','?')}")
-            self.op_status.setStyleSheet("color:#10b981;font-family:monospace;font-size:9px;")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка сохранения", str(e))
-
-    def _ping(self):
-        it=self.tree.currentItem()
-        if not it: return
+    def _ping_all(self):
         self.ping_threads.clear()
-        items=[it.child(i) for i in range(it.childCount())] if not it.parent() else [it]
         self._update_ping_hint()
-        for item in items:
-            item.setText(2,"⏳")
-            proxy=None if (self._active_mode=="tun" or not self._core_running()) \
-                  else "http://127.0.0.1:2080"
-            t=UrlPingThread(proxy=proxy)
-            t.result.connect(lambda ok,ms,st,i=item: i.setText(2,self._fmt_ping(ok,ms,st)))
+        proxy = None if (self._active_mode == "tun" or not self._core_running()) \
+                else "http://127.0.0.1:2080"
+        for tile in self.tiles:
+            tile.set_ping("⏳", "#94a3b8")
+            t = UrlPingThread(proxy=proxy)
+            t.result.connect(lambda ok, ms, st, tl=tile: tl.set_ping(*self._fmt_ping(ok, ms, st)))
             self.ping_threads.append(t); t.start()
 
     @staticmethod
-    def _fmt_ping(ok,ms,status):
-        if not ok: return "ERR"
-        e = "🟢" if ms<200 else ("🟡" if ms<600 else "🔴")
-        return f"{e} {ms:.0f}ms"
+    def _fmt_ping(ok: bool, ms: float, status: int):
+        if not ok:
+            return "ERR", "#ef4444"
+        color = "#10b981" if ms < 200 else ("#f59e0b" if ms < 600 else "#ef4444")
+        return f"{ms:.0f}ms", color
 
-    def _refresh_ip(self):
-        self.b_refresh_ip.setEnabled(False)
-        self.op_status.setText("Резолвинг IP...")
-        self.op_status.setStyleSheet("color:#f59e0b;font-family:monospace;font-size:9px;")
-        self._resolve_worker=ResolveWorker()
-        self._resolve_worker.progress.connect(
-            lambda h: self.op_status.setText(f"Резолвинг: {h}"))
-        self._resolve_worker.finished.connect(self._on_resolve_done)
-        self._resolve_worker.start()
+class ProfileDialog(QDialog):
+    
+    def __init__(self, runner=None, active_mode="proxy", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CLUSTERS"); self.setFixedSize(660, 540)
+        self.setStyleSheet(dialog_style())
+        self.selected_data = None
+        self._runner = runner; self._active_mode = active_mode
+        lay = QVBoxLayout(self); lay.setSpacing(8)
 
-    def _on_resolve_done(self, count):
-        self.b_refresh_ip.setEnabled(True)
-        self.op_status.setText(f"✓ Обновлено {count} IP-адресов")
-        self.op_status.setStyleSheet("color:#10b981;font-family:monospace;font-size:9px;")
+        hdr = QLabel("Клик по кластеру — список инбаундов. ✎ — редактировать. 🔄 — обновить подписку.")
+        hdr.setWordWrap(True)
+        hdr.setStyleSheet("color:#64748b;font-family:monospace;font-size:9px;")
+        lay.addWidget(hdr)
+
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("QScrollArea{border:none;background:#13131f;}")
+        self.scroll.viewport().setStyleSheet("background:#13131f;")
+        self.grid_host = QWidget()
+        self.grid_host.setStyleSheet("background:#13131f;")
+        self.grid = QGridLayout(self.grid_host)
+        self.grid.setSpacing(6)
+        self.grid.setContentsMargins(2, 2, 2, 2)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.scroll.setWidget(self.grid_host)
+        lay.addWidget(self.scroll)
+
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        b_close = QPushButton("Закрыть"); b_close.setStyleSheet(btn_style())
+        b_close.clicked.connect(self.reject)
+        bottom.addWidget(b_close)
+        lay.addLayout(bottom)
+
         self._refresh()
 
-    def _update_sub(self):
-        self.b_update_sub.setEnabled(False)
-        self.op_status.setText("Обновление подписок...")
-        self.op_status.setStyleSheet("color:#f59e0b;font-family:monospace;font-size:9px;")
-        self._sub_worker=SubUpdateWorker()
-        self._sub_worker.progress.connect(
-            lambda name: self.op_status.setText(f"Обновляем: {name}"))
-        self._sub_worker.finished.connect(self._on_sub_done)
-        self._sub_worker.start()
+    def _refresh(self):
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            w = item.widget()
+            if w: w.deleteLater()
 
-    def _on_sub_done(self, updated, errors):
-        self.b_update_sub.setEnabled(True)
-        msg = f"✓ Обновлено {updated} кластеров"
-        if errors: msg += f"  ⚠ {errors} ошибок"
-        self.op_status.setText(msg)
-        self.op_status.setStyleSheet("color:#10b981;font-family:monospace;font-size:9px;")
+        cols = 3; row = col = 0
+        for path in cm.list_cluster_files():
+            try:
+                data = cm.load_cluster(path)
+            except Exception:
+                continue
+            tile = ClusterTile(data, path)
+            tile.clicked.connect(lambda p=path: self._open_cluster(p))
+            tile.editRequested.connect(lambda p=path, d=data: self._edit_cluster(p, d))
+            tile.refreshRequested.connect(lambda p=path: self._refresh_subscription(p))
+            self.grid.addWidget(tile, row, col, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            col += 1
+            if col >= cols: col = 0; row += 1
+
+        add_tile = AddTile()
+        add_tile.setToolTip("Импорт подписки или новый пустой кластер")
+        add_tile.clicked.connect(self._add_cluster_menu)
+        self.grid.addWidget(add_tile, row, col, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+    def _open_cluster(self, path: str):
+        try:
+            data = cm.load_cluster(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e)); return
+        d = InboundsGridDialog(path, data, runner=self._runner,
+                                active_mode=self._active_mode, parent=self)
+        if d.exec() and d.selected_data:
+            self.selected_data = d.selected_data
+            self.accept()
+        else:
+            self._refresh()
+
+    def _edit_cluster(self, path: str, data: dict):
+        d = ClusterEditDialog(data, path, parent=self)
+        if d.exec():
+            self._refresh()
+
+    def _refresh_subscription(self, path: str):
+        try:
+            n = cm.refresh_subscription(path)
+            QMessageBox.information(self, "Подписка обновлена",
+                                     f"Получено {n} инбаундов из подписки.\n"
+                                     f"Вручную добавленные инбаунды сохранены.")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка обновления", str(e))
         self._refresh()
 
-    def _del(self):
-        it=self.tree.currentItem()
-        if it and not it.parent():
-            if QMessageBox.question(self,"Удалить",f"Удалить кластер?",
-               QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No) \
-               == QMessageBox.StandardButton.Yes:
-                os.remove(it.data(0,Qt.ItemDataRole.UserRole)['file']); self._refresh()
+    def _add_cluster_menu(self):
+        menu = QMenu(self)
+        act_sub = menu.addAction("⬇ Импорт подписки")
+        act_empty = menu.addAction("+ Пустой кластер")
+        chosen = menu.exec(QCursor.pos())
+        if chosen == act_sub:
+            self._import_subscription_dialog()
+        elif chosen == act_empty:
+            self._create_empty_cluster_dialog()
 
-    def _finish(self):
-        it=self.tree.currentItem()
-        if it and it.parent():
-            self.selected_data=it.data(0,Qt.ItemDataRole.UserRole); self.accept()
+    def _import_subscription_dialog(self):
+        url, ok = QInputDialog.getText(self, "Импорт подписки", "URL подписки:")
+        if not (ok and url.strip()):
+            return
+        name, ok2 = QInputDialog.getText(
+            self, "Импорт подписки", "Имя кластера:",
+            text=f"Sub_{random.randint(100,999)}")
+        if not ok2:
+            return
+        name = name.strip() or f"Sub_{random.randint(100,999)}"
+        try:
+            cm.import_subscription(url.strip(), name, mode="proxy")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка импорта", str(e)); return
+        self._refresh()
 
-# ── ИКОНКА ТРЕЯ ───────────────────────────────────────────────────────────────
+    def _create_empty_cluster_dialog(self):
+        name, ok = QInputDialog.getText(self, "Новый кластер", "Имя:")
+        if not (ok and name.strip()):
+            return
+        cm.create_empty_cluster(name.strip())
+        self._refresh()
+
 def _make_tray_icon(color: QColor) -> QIcon:
     px=QPixmap(32,32); px.fill(Qt.GlobalColor.transparent)
     p=QPainter(px); p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1830,16 +1875,9 @@ def _make_tray_icon(color: QColor) -> QIcon:
     p.setBrush(color); p.setPen(Qt.PenStyle.NoPen); p.drawPath(path); p.end()
     return QIcon(px)
 
-# ── ГЛАВНОЕ ОКНО ──────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        # ── Очистка ДО создания Runner и любых процессов ────────────────────
-        # 1. Логи — стираются на каждом старте приложения (см. кнопка CLEAR
-        #    в LogPanel делает то же самое вручную).
-        # 2. Зомби sing-box.exe/xray.exe и зависшие TUN-адаптеры от прошлого
-        #    аварийного завершения — без этого sing-box иногда падает с
-        #    'FATAL cannot create file that already exists'.
         try:
             from runner import clear_logs, cleanup_stale_state
             clear_logs()
@@ -1848,7 +1886,7 @@ class MainWindow(QMainWindow):
             print(f"Startup cleanup failed: {e}")
 
         self.runner=Runner(); self.active_p=None
-        self._active_engine_mode=None   # None | "singbox" | "xray" | "dual"
+        self._active_engine_mode=None
         self.active_mode="proxy"; self._drag_pos=None
         self._conn_dialog=None; self._ping_thread=None
         self._active_cluster_file=""
@@ -1906,7 +1944,6 @@ class MainWindow(QMainWindow):
         self.log_panel.b_conn.clicked.connect(self._open_connections)
         lay.addWidget(self.log_panel)
 
-        # ── Индикаторы-лепестки ───────────────────────────────────────────────
         ind_row = QHBoxLayout(); ind_row.setSpacing(10)
         ind_row.addStretch()
         self.ind_core = PetalIndicator("SING-BOX")
@@ -1921,7 +1958,6 @@ class MainWindow(QMainWindow):
         ind_row.addStretch()
         lay.addLayout(ind_row)
 
-        # Watchdog: каждые 2 сек проверяем реальное состояние процесса
         self._watchdog = QTimer(self, interval=2000, timeout=self._watchdog_tick)
         self._watchdog.start()
 
@@ -2017,19 +2053,13 @@ class MainWindow(QMainWindow):
         if self.runner.proc:
             self._log("FORCING CORE RESTART...")
             self.runner.stop()
-            # Для TUN-режима нужно больше времени: сервис async + адаптер должен упасть
             delay = 1800 if self.active_mode == "tun" else 600
             QTimer.singleShot(delay, self._toggle)
         else:
             self._log("CORE NOT RUNNING")
 
     def _on_indicator_clicked(self, label: str):
-        """
-        Клик по индикатору SING-BOX/XRAY/SERVICE — показывает меню с опциями:
-          'Kill process' — жёстко убивает именно этот движок (taskkill),
-                           полезно если процесс завис и не реагирует на stop().
-          'Выйти'        — полный выход из приложения.
-        """
+        
         if label == "SERVICE":
             QMessageBox.information(self, "SERVICE",
                 "Управление Windows-сервисом — в Настройках (⚙).")
@@ -2051,7 +2081,6 @@ class MainWindow(QMainWindow):
         if chosen == a_kill:
             self.runner.force_kill(engine)
             self._log(f"KILLED {label} (вручную, через индикатор)")
-            # Состояние сессии могло держаться на этом процессе — сбрасываем
             if (engine == "xray" and self.active_p and
                     self.active_p.get("protocol") == "vless") or \
                (engine == "singbox" and self.active_p and
@@ -2063,18 +2092,15 @@ class MainWindow(QMainWindow):
         elif chosen == a_exit:
             self._quit_app()
 
+    def _safe_background_check(self):
+        
+        try:
+            self._watchdog_tick()
+        except Exception as e:
+            self._log(f"⚠ background check error: {e}")
+
     def _watchdog_tick(self):
-        """
-        Watchdog честно отражает состояние КАЖДОГО движка, который реально
-        нужен в текущем режиме (self._active_engine_mode):
-          "singbox" — только sing-box (hy2 любой, VLESS native-TUN)
-          "xray"    — только Xray (VLESS PROXY)
-          "dual"    — ОБА движка одновременно (VLESS TUN dual-core):
-                      раньше тут принудительно гасился ind_core, теперь
-                      оба индикатора показывают РЕАЛЬНОЕ состояние своего
-                      процесса независимо друг от друга.
-          None      — не подключены, оба индикатора неактивны.
-        """
+        
         mode = getattr(self, "_active_engine_mode", None)
 
         if mode is None:
@@ -2089,21 +2115,16 @@ class MainWindow(QMainWindow):
         sb_alive = self._is_singbox_running() if needs_sb else None
         xr_alive = self._is_xray_running()    if needs_xr else None
 
-        # Индикаторы — независимо друг от друга, только то что реально нужно
         if needs_sb:
-            self.ind_core.set_state("active" if sb_alive and self._log_is_growing(LOG_FILE)
-                                     else "error")
+            self.ind_core.set_state("active" if sb_alive else "error")
         else:
             self.ind_core.set_state("inactive")
 
         if needs_xr:
-            self.ind_xray.set_state("active" if xr_alive and self._log_is_growing(XRAY_LOG_FILE)
-                                     else "error")
+            self.ind_xray.set_state("active" if xr_alive else "error")
         else:
             self.ind_xray.set_state("inactive")
 
-        # Главный алмаз (dia) "on" только если ВСЕ нужные для этого режима
-        # движки живы — в dual-режиме обрыв любого из двух рвёт туннель целиком.
         overall_alive = (sb_alive if needs_sb else True) and (xr_alive if needs_xr else True)
 
         if overall_alive and self.dia.state != "on":
@@ -2122,7 +2143,7 @@ class MainWindow(QMainWindow):
         self._watchdog_service_tick()
 
     def _watchdog_service_tick(self):
-        """SERVICE индикатор — отдельно, не зависит от режима движков."""
+        
         try:
             from runner import service_installed, service_running
             if not service_installed():
@@ -2134,10 +2155,9 @@ class MainWindow(QMainWindow):
         except Exception:
             self.ind_svc.set_state("inactive")
 
-    # ── Вспомогательные методы watchdog ──────────────────────────────────────
     @staticmethod
     def _is_singbox_running() -> bool:
-        """True если sing-box.exe есть среди процессов ОС."""
+        
         if HAS_PSUTIL:
             for p in psutil.process_iter(["name"]):
                 try:
@@ -2146,7 +2166,6 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             return False
-        # Fallback без psutil — tasklist
         try:
             out = subprocess.check_output(
                 ["tasklist", "/FI", "IMAGENAME eq sing-box.exe", "/NH"],
@@ -2159,7 +2178,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _is_xray_running() -> bool:
-        """True если xray.exe есть среди процессов ОС."""
+        
         if HAS_PSUTIL:
             for p in psutil.process_iter(["name"]):
                 try:
@@ -2180,22 +2199,13 @@ class MainWindow(QMainWindow):
             return False
 
     def _log_is_growing(self, path: str = None) -> bool:
-        """
-        True если указанный лог-файл изменился за последние ~4 сек.
-        Первый вызов для каждого пути всегда возвращает True (даём ядру
-        секунду на раскрутку). path по умолчанию — LOG_FILE (sing-box),
-        для проверки Xray передавай XRAY_LOG_FILE.
-
-        Состояние хранится по ключу path в словаре — иначе при одновременной
-        проверке двух движков (dual-core режим) они бы затирали общие
-        атрибуты self._last_log_mtime/_last_log_check друг у друга.
-        """
+        
         if path is None:
             path = LOG_FILE
         try:
             mtime = os.path.getmtime(path)
         except OSError:
-            return False   # файла нет вовсе
+            return False
 
         now = time.monotonic()
         state = getattr(self, "_log_growing_state", None)
@@ -2207,8 +2217,7 @@ class MainWindow(QMainWindow):
         state[path] = (mtime, now)
 
         if last_mtime is None:
-            return True    # первый вызов для этого файла — считаем OK
-        # Лог обновлялся менее 4 секунд назад относительно реального времени
+            return True
         return (now - last_check) < 4.0 or (mtime != last_mtime)
 
     def _toggle(self):
@@ -2223,7 +2232,6 @@ class MainWindow(QMainWindow):
             self._active_engine_mode = None
             clear_session(); return
 
-        # ── Определяем протокол и режим ──────────────────────────────────────
         protocol = self.active_p.get("protocol", "hysteria2")
         is_vless = (protocol == "vless")
         use_tun  = (self.active_mode == "tun")
@@ -2240,9 +2248,6 @@ class MainWindow(QMainWindow):
                 else: QMessageBox.warning(self, "Отказано", "UAC-запрос отклонён.")
             return
 
-        # Полная очистка зомби-процессов и зависших TUN-адаптеров ПЕРЕД
-        # каждым стартом — устраняет 'FATAL cannot create file that already
-        # exists' и похожие ошибки из-за недочищенного состояния прошлой сессии.
         try:
             from runner import cleanup_stale_state
             cleanup_stale_state()
@@ -2252,28 +2257,19 @@ class MainWindow(QMainWindow):
         s_cfg = load_settings()
         self.log_panel.reset_tail()
 
-        # ══════════════════════════════════════════════════════════════════════
-        # VLESS + TUN — DUAL CORE ARCHITECTURE (Sing-box TUN -> Xray SOCKS5)
-        # Идеальный баланс: process_name работает через Sing-box,
-        # а XHTTP-транспорт и Reality тянет Xray на максимальной скорости.
-        # ══════════════════════════════════════════════════════════════════════
         if is_vless and use_tun:
-            # 1. Генерируем Xray backend (транспорт)
             xray_cfg = build_vless_backend(self.active_p, socks_port=2082)
             with open(os.path.join(_BASE, "temp_xray.json"), "w") as f:
                 json.dump(xray_cfg, f, indent=2)
 
-            # 2. Генерируем Sing-box TUN frontend (роутинг по процессам)
             sb_cfg = build_tun_via_socks(self.active_p, socks_port=2082, s=s_cfg)
 
-            # Форсируем оптимизации для локального моста прямо здесь
             sb_cfg["inbounds"][0]["mtu"] = 9000
             sb_cfg["outbounds"][0]["tcp_fast_open"] = True
 
             with open(os.path.join(_BASE, "temp_sb_tun.json"), "w") as f:
                 json.dump(sb_cfg, f, indent=2)
 
-            # 3. Поднимаем сначала Xray (чтобы открыл порт 2082 и ждал трафик)
             xray_ok = self.runner.start_secondary(os.path.join(_BASE, "temp_xray.json"), core="xray")
             if not xray_ok:
                 self._log("XRAY BACKEND ERR — не удалось запустить (см. лог XRAY)")
@@ -2281,14 +2277,13 @@ class MainWindow(QMainWindow):
                 self._active_engine_mode = None
                 return
 
-            # 4. Поднимаем Sing-box TUN
             ok = self.runner.start(os.path.join(_BASE, "temp_sb_tun.json"),
                                    use_tun=True, core="singbox")
             if ok:
-                self._active_engine_mode = "dual"   # ОБА движка должны быть живы
+                self._active_engine_mode = "dual"
                 self.dia.set_state("on")
-                self.ind_core.set_state("active")    # Sing-box работает (перехват)
-                self.ind_xray.set_state("active")    # Xray работает (VLESS/XHTTP)
+                self.ind_core.set_state("active")
+                self.ind_xray.set_state("active")
                 self._tray.setIcon(_make_tray_icon(C_ON))
                 self._tray.showMessage("sb-hy2", "Подключено [Dual Core TUN/VLESS]",
                                        QSystemTrayIcon.MessageIcon.Information, 2000)
@@ -2303,10 +2298,9 @@ class MainWindow(QMainWindow):
                 self.ind_core.set_state("error")
                 self.ind_xray.set_state("error")
                 self._active_engine_mode = None
-                self.runner._stop_secondary()   # глушим Xray, раз sing-box не поднялся
+                self.runner._stop_secondary()
             return
 
-        # ── Обычные режимы (VLESS PROXY / HY2 PROXY / HY2 TUN) ───────────────
         if is_vless:
             cfg        = build_vless_proxy(self.active_p, s_cfg)
             core       = "xray"
@@ -2366,7 +2360,6 @@ class MainWindow(QMainWindow):
         p=QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(QPen(C_ACCENT,1))
         p.drawRoundedRect(0,0,self.width()-1,self.height()-1,12,12)
-
 
 if __name__=="__main__":
     app=QApplication(sys.argv)

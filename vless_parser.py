@@ -1,14 +1,9 @@
-# vless_parser.py — парсер vless:// URI для Xray
-# Поддерживаемые транспорты: tcp, ws, xhttp/splithttp, grpc, h2, quic, kcp
-# Поддерживаемая безопасность:  none, tls, reality
 import json
 import socket
 from urllib.parse import urlparse, parse_qs, unquote
 
-
-# ── Резолвинг (аналогичен hy2_parser) ────────────────────────────────────────
 def _resolve_direct(host: str, dns_server: str = "8.8.8.8", port: int = 53):
-    """UDP DNS-запрос напрямую к dns_server, минуя системный (возможно fake-ip) DNS."""
+
     import struct, random
 
     def _build_query(name: str):
@@ -59,9 +54,8 @@ def _resolve_direct(host: str, dns_server: str = "8.8.8.8", port: int = 53):
     except Exception:
         return None
 
-
 def _resolve(host: str) -> str | None:
-    """IP или None. Сначала прямой DNS (8.8.8.8), потом системный."""
+
     try:
         socket.inet_aton(host); return host
     except OSError:
@@ -86,19 +80,8 @@ def _resolve(host: str) -> str | None:
     print(f"  ⚠ не удалось зарезолвить {host}")
     return None
 
-
-# ── Основной парсер ───────────────────────────────────────────────────────────
 def parse_vless(uri: str) -> dict:
-    """
-    Парсит vless:// URI в словарь параметров.
 
-    Поддерживает:
-      Транспорт: tcp, ws, xhttp (splithttp), grpc, h2, quic, kcp/mkcp
-      Безопасность: none, tls, reality
-      XHTTP extra: параметры передаются через ?extra=<json>
-
-    Возвращает dict с полем "protocol": "vless" для детекции в GUI.
-    """
     uri = uri.strip()
     if not uri.startswith("vless://"):
         raise ValueError("URI должен начинаться с vless://")
@@ -116,10 +99,9 @@ def parse_vless(uri: str) -> dict:
     def first(key, default=None):
         return qs[key][0] if key in qs else default
 
-    security  = first("security", "none")   # none | tls | reality
-    transport = first("type", "tcp")        # tcp | ws | xhttp | grpc | h2 | quic | kcp
+    security  = first("security", "none")
+    transport = first("type", "tcp")
 
-    # XHTTP extra — JSON-строка в параметре extra или mode (от разных клиентов)
     extra_raw = first("extra", "")
     xhttp_extra: dict = {}
     if extra_raw:
@@ -128,60 +110,48 @@ def parse_vless(uri: str) -> dict:
         except Exception:
             pass
 
-    # ALPN: "h2,http/1.1" → список
     alpn_raw = first("alpn", "")
     alpn = [a.strip() for a in alpn_raw.split(",") if a.strip()] if alpn_raw else []
 
     resolved_ip = _resolve(host)
 
     return {
-        # ── Мета ─────────────────────────────────────────────────────────────
         "protocol":    "vless",
         "name":        name,
 
-        # ── Адрес ────────────────────────────────────────────────────────────
         "host":        host,
         "port":        port,
         "resolved_ip": resolved_ip,
 
-        # ── VLESS пользователь ───────────────────────────────────────────────
         "uuid":        uuid,
         "encryption":  first("encryption", "none"),
-        "flow":        first("flow", ""),            # xtls-rprx-vision и др.
+        "flow":        first("flow", ""),
 
-        # ── Безопасность ─────────────────────────────────────────────────────
         "security":    security,
         "sni":         first("sni", host),
-        "fp":          first("fp", "chrome"),         # TLS fingerprint
+        "fp":          first("fp", "chrome"),
         "alpn":        alpn,
         "allow_insecure": first("allowInsecure", "0") == "1",
 
-        # Reality
-        "pbk":         first("pbk", ""),              # publicKey (base64url)
-        "sid":         first("sid", ""),              # shortId
-        "spx":         first("spx", "/"),             # spiderX
+        "pbk":         first("pbk", ""),
+        "sid":         first("sid", ""),
+        "spx":         first("spx", "/"),
 
-        # ── Транспорт ────────────────────────────────────────────────────────
         "transport":   transport,
 
-        # WS / XHTTP / H2 — общий path/host
         "path":        first("path", "/"),
-        "host_header": first("host", ""),             # Host-заголовок
+        "host_header": first("host", ""),
 
-        # XHTTP (SplitHTTP)
         "xhttp_mode":  xhttp_extra.get("mode", first("mode", "auto")),
-        "xhttp_extra": xhttp_extra,                   # Весь блок extra → xhttpSettings
+        "xhttp_extra": xhttp_extra,
 
-        # gRPC
         "service_name": first("serviceName", ""),
         "grpc_multi":   first("mode", "gun") == "multi",
 
-        # QUIC
         "quic_security": first("quicSecurity", "none"),
         "quic_key":      first("key", ""),
         "quic_header":   first("headerType", "none"),
 
-        # KCP / mKCP
         "kcp_seed":   first("seed", ""),
         "kcp_header": first("headerType", "none"),
     }
