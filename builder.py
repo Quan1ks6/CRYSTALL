@@ -1,3 +1,4 @@
+# builder.py — генератор конфигов sing-box >= 1.13
 import subprocess
 import re
 from rules import get_route_rules
@@ -11,6 +12,10 @@ def _is_ip(address: str) -> bool:
         return False
 
 def get_default_gateway() -> str | None:
+    """
+    Определяет IP дефолтного шлюза через 'route print 0.0.0.0'.
+    Возвращает строку IP или None.
+    """
     try:
         out = subprocess.check_output(
             ["route", "print", "0.0.0.0"],
@@ -26,6 +31,7 @@ def get_default_gateway() -> str | None:
     return None
 
 def _dns_direct_server() -> dict:
+    """UDP резолвер для бутстрапа — хардкод 8.8.8.8, не зависит от системы."""
     return {
         "tag":    "dns-direct",
         "type":   "udp",
@@ -33,7 +39,69 @@ def _dns_direct_server() -> dict:
     }
 
 
+def _dns_blocks(p: dict, s: dict, tun_mode: bool,
+                 host_rule: dict | None = None) -> dict:
+    """
+    Возвращает блок "dns" для sing-box конфига.
+
+    Настраивается через settings (s):
+      dns_upstream  — IP/hostname удалённого DNS (по умолч. 1.1.1.1)
+      dns_no_leak   — True (по умолч.) / False:
+           True  → Fake-IP (без DNS-утечек, трафик через туннель)
+           False → Реальный DNS через upstream (утечка возможна, но
+                   работают сервисы, завязанные на конкретный IP)
+
+    host_rule — переопределяет правило для хоста сервера, используется
+    в build_tun_via_socks где хост уже мог быть раньше разрезолвлен в IP.
+    """
+    upstream = s.get("dns_upstream", "1.1.1.1").strip() or "1.1.1.1"
+    no_leak  = s.get("dns_no_leak", True) if tun_mode else False
+
+    servers = [
+        {
+            "tag":             "dns-remote",
+            "type":            "udp",
+            "server":          upstream,
+            "domain_resolver": "dns-direct",
+        },
+        _dns_direct_server(),
+    ]
+
+    server_rule = host_rule or {"domain": [p["host"]]}
+    rules = [{**server_rule, "server": "dns-direct"}]
+
+    if tun_mode and no_leak:
+        servers.append({
+            "tag":         "dns-fakeip",
+            "type":        "fakeip",
+            "inet4_range": "198.18.0.0/15",
+        })
+        rules.append({"query_type": ["A"],    "server": "dns-fakeip"})
+        rules.append({"query_type": ["AAAA"], "action": "reject"})
+
+    return {
+        "servers":  servers,
+        "rules":    rules,
+        "strategy": "ipv4_only",
+        "final":    "dns-remote",
+    }
+
+
+def _log_block(s: dict) -> dict:
+    """
+    Блок "log" для конфига sing-box.
+    Если dns_log_to_file=False — выключаем уровень (только stderr/stdout),
+    sing-box всё равно пишет в stdout, GUI LogTailThread читает файл —
+    поэтому вместо отключения просто меняем уровень на warn чтобы
+    не засорять файл INFO-сообщениями когда пользователь отключил логи.
+    """
+    if s.get("log_to_file", True):
+        return {"level": "info"}
+    return {"level": "warn", "timestamp": True}
+
+
 def _outbound(p: dict) -> dict:
+    """Hysteria2 outbound. uTLS не используем — несовместимо с QUIC."""
     server_addr = p.get("resolved_ip") or p["host"]
 
     tls: dict = {
@@ -43,8 +111,6 @@ def _outbound(p: dict) -> dict:
     }
     if p.get("alpn"):
         tls["alpn"] = p["alpn"]
-    if p.get("pinned_cert"):
-        tls["certificate_fingerprint"] = p["pinned_cert"]
 
     ob = {
         "type":        "hysteria2",
@@ -58,6 +124,10 @@ def _outbound(p: dict) -> dict:
         "tls": tls,
     }
 
+    # Port Hopping — sing-box принимает диапазон портов в server_ports
+    # (формат "start:end", через запятую можно несколько) + hop_interval,
+    # вместо одиночного server_port. Конвертируем из формата share-ссылки
+    # "start-end[,start2-end2]" в формат sing-box "start:end[,start2:end2]".
     hop = p.get("port_hopping")
     ranges = []
     if hop:
@@ -85,31 +155,18 @@ def _outbound(p: dict) -> dict:
 
 
 def build_proxy(p: dict, s: dict = None) -> dict:
+    """PROXY режим — HTTP/SOCKS5 на 127.0.0.1:2080."""
     if s is None: s = {}
     
     return {
-        "log": {"level": "info"},
-        "dns": {
-            "servers": [
-                {
-                    "tag":             "dns-remote",
-                    "type":            "udp",
-                    "server":          "1.1.1.1",
-                    "domain_resolver": "dns-direct",
-                },
-                _dns_direct_server(),
-            ],
-            "rules": [
-                {"domain": [p["host"]], "server": "dns-direct"},
-            ],
-            "strategy": "ipv4_only",
-            "final":    "dns-remote",
-        },
+        "log": _log_block(s),
+        "dns": _dns_blocks(p, s, tun_mode=False),
         "inbounds": [{
             "type":        "mixed",
             "tag":         "mixed-in",
             "listen":      "127.0.0.1",
             "listen_port": 2080
+            # СНИФФИНГА ЗДЕСЬ БОЛЬШЕ НЕТ
         }],
         "outbounds": [
             _outbound(p),
@@ -121,7 +178,7 @@ def build_proxy(p: dict, s: dict = None) -> dict:
 def _build_route_proxy(p: dict) -> dict:
     user_rules, final = get_route_rules()
     system_rules = [
-        {"action": "sniff"},
+        {"action": "sniff"}, # <--- Сниффинг теперь живет тут
         {"domain": [p["host"]], "outbound": "direct"},
     ]
     return {
@@ -148,39 +205,18 @@ def _build_exclude_address(s: dict) -> list[str]:
 
 
 def build_tun(p: dict, s: dict = None) -> dict:
+    """TUN режим — весь трафик системы через прокси, без DNS-утечек."""
     if s is None: s = {}
 
     exclude_addr = _build_exclude_address(s)
 
     return {
-        "log": {"level": "info"},
-        "dns": {
-            "servers": [
-                {
-                    "tag":             "dns-remote",
-                    "type":            "udp",
-                    "server":          "1.1.1.1",
-                    "domain_resolver": "dns-direct",
-                },
-                _dns_direct_server(),
-                {
-                    "tag":         "dns-fakeip",
-                    "type":        "fakeip",
-                    "inet4_range": "198.18.0.0/15",
-                },
-            ],
-            "rules": [
-                {"domain": [p["host"]], "server": "dns-direct"},
-                {"query_type": ["A"],    "server": "dns-fakeip"},
-                {"query_type": ["AAAA"], "action": "reject"},
-            ],
-            "strategy": "ipv4_only",
-            "final":    "dns-remote",
-        },
+        "log": _log_block(s),
+        "dns": _dns_blocks(p, s, tun_mode=True),
         "inbounds": [{
-            "type":                  "tun",
+            "type":                  "tun", # или "mixed"
             "tag":                   "tun-in",
-            "interface_name":        "sb-tun",
+            "interface_name":        "sb-tun", # Возвращаем старый добрый interface_name!
             "address":               ["172.19.0.1/30"],
             "mtu":                   int(s.get("tun_mtu", 1500)),
             "auto_route":            s.get("tun_auto_route", True),
@@ -251,34 +287,12 @@ def build_tun_via_socks(p: dict, socks_port: int = 2081, s: dict = None) -> dict
     host_rule = {"ip_cidr": [f"{p['host']}/32"]} if _is_ip(p["host"]) else {"domain": [p["host"]]}
 
     return {
-        "log": {"level": "info"},
-        "dns": {
-            "servers": [
-                {
-                    "tag":             "dns-remote",
-                    "type":            "udp",
-                    "server":          "1.1.1.1",
-                    "domain_resolver": "dns-direct",
-                },
-                _dns_direct_server(),
-                {
-                    "tag":         "dns-fakeip",
-                    "type":        "fakeip",
-                    "inet4_range": "198.18.0.0/15",
-                },
-            ],
-            "rules": [
-                {**host_rule, "server": "dns-direct"},
-                {"query_type": ["A"],    "server": "dns-fakeip"},
-                {"query_type": ["AAAA"], "action": "reject"},
-            ],
-            "strategy": "ipv4_only",
-            "final":    "dns-remote",
-        },
+        "log": _log_block(s),
+        "dns": _dns_blocks(p, s, tun_mode=True, host_rule=host_rule),
         "inbounds": [{
-            "type":                  "tun",
+            "type":                  "tun", # или "mixed"
             "tag":                   "tun-in",
-            "interface_name":        "sb-tun",
+            "interface_name":        "sb-tun", # Возвращаем старый добрый interface_name!
             "address":               ["172.19.0.1/30"],
             "mtu":                   int(s.get("tun_mtu", 1500)),
             "auto_route":            s.get("tun_auto_route", True),
@@ -331,8 +345,10 @@ def _vless_tls(p: dict) -> dict | None:
 
 
 def _vless_transport(p: dict) -> dict | None:
+    """Строит блок transport для sing-box VLESS outbound (совместимо с 1.13+)."""
     transport = p.get("transport", "tcp")
 
+    # В sing-box 1.13+ транспорта 'xhttp' нет, вместо него используется 'http'
     if transport in ("splithttp", "xhttp", "h2"):
         transport = "http"
     elif transport == "mkcp":
@@ -350,11 +366,13 @@ def _vless_transport(p: dict) -> dict | None:
                 t["headers"] = {"Host": p["host_header"]}
 
         case "http":
+            # Универсальный HTTP транспорт в 1.13+ (сюда входят h2, xhttp/splithttp)
             t["path"] = p.get("path", "/")
             
             if p.get("host_header"):
                 t["host"] = [p["host_header"]]
                 
+            # Черный список параметров, которые переварит только Xray
             xray_exclusive = {
                 "xPaddingBytes", 
                 "scMaxEachPostBytes", 
@@ -364,9 +382,10 @@ def _vless_transport(p: dict) -> dict | None:
                 "scv"
             }
             
+            # Копируем кастомные заголовки, отсекая несовместимый мусор
             for k, v in p.get("xhttp_extra", {}).items():
                 if k in xray_exclusive:
-                    continue
+                    continue # Игнорируем Xray-параметры, чтобы sing-box не паниковал
                 if k not in ("mode", "host") and k not in t:
                     t[k] = v
 
@@ -435,39 +454,18 @@ def _build_route_tun_vless_native(p: dict) -> dict:
 
 
 def build_vless_tun_native(p: dict, s: dict = None) -> dict:
+    """TUN-режим для VLESS через sing-box 1.13+ (нативный)."""
     if s is None: s = {}
 
     exclude_addr = _build_exclude_address(s)
 
     return {
-        "log": {"level": "info"},
-        "dns": {
-            "servers": [
-                {
-                    "tag":             "dns-remote",
-                    "type":            "udp",
-                    "server":          "1.1.1.1",
-                    "domain_resolver": "dns-direct",
-                },
-                _dns_direct_server(),
-                {
-                    "tag":         "dns-fakeip",
-                    "type":        "fakeip",
-                    "inet4_range": "198.18.0.0/15",
-                },
-            ],
-            "rules": [
-                {"domain": [p["host"]], "server": "dns-direct"},
-                {"query_type": ["A"],    "server": "dns-fakeip"},
-                {"query_type": ["AAAA"], "action": "reject"},
-            ],
-            "strategy": "ipv4_only",
-            "final":    "dns-remote",
-        },
+        "log": _log_block(s),
+        "dns": _dns_blocks(p, s, tun_mode=True),
         "inbounds": [{
-            "type":                  "tun",
+            "type":                  "tun", # или "mixed"
             "tag":                   "tun-in",
-            "interface_name":        "sb-tun",
+            "interface_name":        "sb-tun", # Возвращаем старый добрый interface_name!
             "address":               ["172.19.0.1/30"],
             "mtu":                   int(s.get("tun_mtu", 1500)),
             "auto_route":            s.get("tun_auto_route", True),

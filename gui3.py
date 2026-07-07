@@ -61,17 +61,19 @@ except ImportError:
         DEFAULT_PALETTE=["#7c3aed"],
     )
 
+# ── Пути ──────────────────────────────────────────────────────────────────────
 _BASE = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
         else os.path.dirname(os.path.abspath(__file__))
 CLUSTERS_DIR  = os.path.join(_BASE, "clusters")
 RULES_FILE    = os.path.join(_BASE, "rules.txt")
-PRESETS_FILE  = os.path.join(_BASE, "presets.json")
+PRESETS_FILE  = os.path.join(_BASE, "presets.json") 
 LOG_FILE      = os.path.join(_BASE, "logs", "sb.log")
 XRAY_LOG_FILE = os.path.join(_BASE, "logs", "xray.log")
 SETTINGS_FILE = os.path.join(_BASE, "settings.json")
 os.makedirs(CLUSTERS_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
+# ── Сохранение/восстановление сессии ─────────────────────────────────────────
 SESSION_FILE = os.path.join(_BASE, "session.json")
 
 def save_session(profile: dict, mode: str, cluster_file: str):
@@ -94,6 +96,7 @@ def clear_session():
     except Exception:
         pass
 
+# ── Автостарт Windows (реестр) ────────────────────────────────────────────────
 APP_NAME    = "sb-hy2"
 
 def get_autostart() -> bool:
@@ -117,6 +120,8 @@ def set_autostart(enable: bool):
     except OSError:
         pass
 
+
+# ── Настройки ─────────────────────────────────────────────────────────────────
 def load_settings() -> dict:
     defaults = {
         "autostart": False,
@@ -130,10 +135,18 @@ def load_settings() -> dict:
         "route_exclude_auto_gw": True,
         "route_exclude_address": ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"],
         "service_port": 33212,
+        "dns_upstream": "1.1.1.1",
+        "dns_no_leak":  True,
+        "log_to_file":  True,
+        "delete_logs_on_exit":  False,
+        "use_gen_config":       True,
+        "custom_config_path":   "",
+        "xray_udp_encoding":    "none",
     }
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
             loaded = json.load(f)
+        # Мержим: не затираем новые дефолты если ключа нет
         for k, v in defaults.items():
             loaded.setdefault(k, v)
         return loaded
@@ -144,9 +157,10 @@ def save_settings(s: dict):
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(s, f, indent=2)
 
+# ── Обновление подписок ───────────────────────────────────────────────────────
 class SubUpdateWorker(QThread):
-    progress = pyqtSignal(str)
-    finished = pyqtSignal(int, int)
+    progress = pyqtSignal(str)   
+    finished = pyqtSignal(int, int)  
 
     def run(self):
         updated = 0; errors = 0
@@ -162,6 +176,7 @@ class SubUpdateWorker(QThread):
                 print(f"Sub update error {f}: {e}"); errors += 1
         self.finished.emit(updated, errors)
 
+# ── Обновление resolved_ip во всех кластерах ─────────────────────────────────
 class ResolveWorker(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(int)
@@ -177,6 +192,8 @@ class ResolveWorker(QThread):
                     host = p.get("host", "")
                     if not host: continue
                     self.progress.emit(host)
+                    # Используем vless_parser._resolve для vless (он тот же алгоритм)
+                    # hy2_parser._resolve совместим с обоими
                     new_ip = _resolve(host)
                     if new_ip and new_ip != p.get("resolved_ip"):
                         p["resolved_ip"] = new_ip; changed = True; count += 1
@@ -187,6 +204,7 @@ class ResolveWorker(QThread):
                 print(f"Resolve error {f}: {e}")
         self.finished.emit(count)
 
+# ── Цвета и стили ─────────────────────────────────────────────────────────────
 C_ACCENT = QColor("#7c3aed")
 C_ON     = QColor("#10b981")
 C_OFF    = QColor("#ef4444")
@@ -254,6 +272,8 @@ def table_style() -> str:
         "padding:5px 4px;color:#7c9cbf;font-family:monospace;font-size:9px;"
         "font-weight:bold;}"
         "QHeaderView{background:#1e2a3a;}"
+        # Угловая кнопка "выделить всё" (пересечение заголовков) — по умолчанию
+        # белый квадрат, который выбивается из тёмной палитры.
         "QTableCornerButton::section{"
         "background:#1e2a3a;border:none;border-bottom:1px solid #334155;}"
         "QScrollBar:vertical{background:#0f172a;width:8px;border-radius:4px;}"
@@ -277,6 +297,7 @@ def fmt_bytes(n: int) -> str:
     if n < 1024**3: return f"{n/1024**2:.1f} MB"
     return f"{n/1024**3:.2f} GB"
 
+# ── ФОН: ЖИВАЯ СЕТКА ──────────────────────────────────────────────────────────
 class BackgroundWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -302,6 +323,7 @@ class BackgroundWidget(QWidget):
         p.setBrush(QColor(124,58,237,180)); p.setPen(Qt.PenStyle.NoPen)
         for pt in self.pts: p.drawEllipse(pt["pos"], 1.5, 1.5)
 
+# ── КНОПКА-ЛЕПЕСТОК ───────────────────────────────────────────────────────────
 class CyberBlade(QWidget):
     clicked = pyqtSignal()
     def __init__(self, label, angle, parent=None):
@@ -343,6 +365,7 @@ class CyberBlade(QWidget):
             p.setFont(QFont("monospace", 8, QFont.Weight.Bold))
             p.drawText(QRectF(-bw/2,-bh/2,bw,bh), Qt.AlignmentFlag.AlignCenter, self.label)
 
+# ── ЦЕНТРАЛЬНЫЙ АЛМАЗ ─────────────────────────────────────────────────────────
 class DiamondWidget(QWidget):
     clicked = pyqtSignal()
     def __init__(self, parent=None):
@@ -367,12 +390,21 @@ class DiamondWidget(QWidget):
         p.setPen(Qt.GlobalColor.white); p.setFont(QFont("monospace",10,QFont.Weight.Bold))
         p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.state.upper())
 
+# ── ИНДИКАТОР-ЛЕПЕСТОК ────────────────────────────────────────────────────────
 class PetalIndicator(QWidget):
-    
+    """
+    Маленький лепесток-индикатор с тремя состояниями:
+      'inactive' — тёмный (не активен)
+      'active'   — зелёный (работает)
+      'error'    — красный (упал / ошибка)
+
+    Кликабелен: по клику эмиттит clicked(label) — MainWindow показывает
+    меню 'Kill process / Выйти' (см. _on_indicator_clicked).
+    """
     clicked = pyqtSignal(str)
 
     _COLORS = {
-        "inactive": (QColor("#1e293b"), QColor("#334155")),
+        "inactive": (QColor("#1e293b"), QColor("#334155")),   # fill, border
         "active":   (QColor("#064e3b"), QColor("#10b981")),
         "error":    (QColor("#450a0a"), QColor("#ef4444")),
     }
@@ -381,7 +413,7 @@ class PetalIndicator(QWidget):
         super().__init__(parent)
         self.label  = label
         self._state = "inactive"
-        self._phase = random.random() * 6.28
+        self._phase = random.random() * 6.28   # случайный сдвиг пульса
         self.setFixedSize(80, 36)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._timer = QTimer(self, interval=40, timeout=self._tick)
@@ -395,7 +427,7 @@ class PetalIndicator(QWidget):
         self.update()
 
     def set_state(self, state: str):
-        
+        """state: 'inactive' | 'active' | 'error'"""
         if state == self._state:
             return
         self._state = state
@@ -416,10 +448,12 @@ class PetalIndicator(QWidget):
 
         fill_c, border_c = self._COLORS.get(self._state, self._COLORS["inactive"])
 
+        # Пульс для активных состояний
         pulse = 0.0
         if self._state != "inactive":
             pulse = math.sin(self._phase) * 0.18
 
+        # Лепесток — параллелограмм с закруглёнными углами
         off = 6
         path = QPainterPath()
         path.moveTo(off,       2)
@@ -428,6 +462,7 @@ class PetalIndicator(QWidget):
         path.lineTo(2,         H - 2)
         path.closeSubpath()
 
+        # Свечение
         if self._state != "inactive":
             alpha = int(40 + 30 * pulse)
             glow_c = QColor(border_c.red(), border_c.green(), border_c.blue(), alpha)
@@ -439,17 +474,21 @@ class PetalIndicator(QWidget):
             inflate = int(4 + 3 * pulse)
             p.drawEllipse(QRectF(-inflate, -inflate, W + inflate*2, H + inflate*2))
 
+        # Тело
         bc = QColor(border_c.red(), border_c.green(), border_c.blue(),
                     int(200 + 55 * (1 + pulse)))
         p.setBrush(fill_c)
         p.setPen(QPen(bc, 1.2))
         p.drawPath(path)
 
+        # Лейбл
         lbl_c = border_c if self._state != "inactive" else QColor("#475569")
         p.setPen(lbl_c)
         p.setFont(QFont("monospace", 7, QFont.Weight.Bold))
         p.drawText(QRectF(0, 0, W, H - 2), Qt.AlignmentFlag.AlignCenter, self.label)
 
+
+# ── ТУМБЛЕР PROXY / TUN ───────────────────────────────────────────────────────
 class ModeToggle(QWidget):
     toggled = pyqtSignal(str)
     def __init__(self, parent=None):
@@ -490,6 +529,7 @@ class ModeToggle(QWidget):
         p.setPen(Qt.GlobalColor.white if self._mode=="tun" else QColor("#64748b"))
         p.drawText(QRectF(W//2,0,W//2,H), Qt.AlignmentFlag.AlignCenter, "TUN")
 
+# ── КНОПКА ШЕСТЕРЁНКИ ─────────────────────────────────────────────────────────
 class GearButton(QWidget):
     clicked = pyqtSignal()
     def __init__(self, parent=None):
@@ -526,8 +566,13 @@ class GearButton(QWidget):
         p.setBrush(c); p.setPen(Qt.PenStyle.NoPen); p.drawPath(path)
         p.setBrush(QColor("#1a1a2e")); p.drawEllipse(QPointF(0,0), r_hole, r_hole)
 
+# ── ДИАЛОГ НАСТРОЕК ───────────────────────────────────────────────────────────
 class SettingsDialog(QDialog):
-    
+    """
+    Настройки с боковой навигацией через QStackedWidget.
+    Страницы: APP  |  TUN & NETWORK  |  SERVICE
+    Все данные буферизуются в self._s и сохраняются одной кнопкой.
+    """
     _COMMON = (
         "QCheckBox{color:#e2e8f0;font-family:monospace;font-size:10px;spacing:8px;}"
         "QCheckBox::indicator{width:15px;height:15px;border-radius:4px;"
@@ -553,6 +598,7 @@ class SettingsDialog(QDialog):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # ── Header ────────────────────────────────────────────────────────────
         self._hdr = QLabel("⚙  SETTINGS")
         self._hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._hdr.setStyleSheet(
@@ -561,14 +607,18 @@ class SettingsDialog(QDialog):
             "border-bottom:1px solid #2d3748;")
         root.addWidget(self._hdr)
 
+        # ── Stack ─────────────────────────────────────────────────────────────
         self._stack = QStackedWidget()
         root.addWidget(self._stack, 1)
 
-        self._stack.addWidget(self._page_main())
-        self._stack.addWidget(self._page_app())
-        self._stack.addWidget(self._page_tun())
-        self._stack.addWidget(self._page_service())
+        self._stack.addWidget(self._page_main())     # 0 — главное меню
+        self._stack.addWidget(self._page_app())      # 1
+        self._stack.addWidget(self._page_tun())      # 2
+        self._stack.addWidget(self._page_service())  # 3
+        self._stack.addWidget(self._page_dns())      # 4
+        self._stack.addWidget(self._page_xray())     # 5
 
+        # ── Bottom bar ────────────────────────────────────────────────────────
         bot = QHBoxLayout()
         bot.setContentsMargins(12, 6, 12, 10)
         bot.setSpacing(8)
@@ -587,6 +637,7 @@ class SettingsDialog(QDialog):
 
         self._go_main()
 
+    # ── Navigation ────────────────────────────────────────────────────────────
     def _go_main(self):
         self._stack.setCurrentIndex(0)
         self._hdr.setText("⚙  SETTINGS")
@@ -610,13 +661,16 @@ class SettingsDialog(QDialog):
             "QPushButton:pressed{background:#0f0f20;}")
         return b
 
+    # ── PAGE 0: menu ─────────────────────────────────────────────────────────
     def _page_main(self) -> QWidget:
         w = QWidget(); lay = QVBoxLayout(w)
         lay.setContentsMargins(20, 20, 20, 8); lay.setSpacing(10)
         items = [
-            ("🖥", "APP",         "Автостарт, тихий старт, восстановление сессии", 1),
-            ("📡", "TUN & NETWORK","Стек, MTU, маршруты, exclude address",          2),
-            ("🔌", "SERVICE",      "Windows-сервис для TUN без UAC",                3),
+            ("🖥", "APP",          "Автостарт, тихий старт, восстановление сессии", 1),
+            ("📡", "TUN & NETWORK","Стек, MTU, маршруты, exclude address",           2),
+            ("🔌", "SERVICE",       "Windows-сервис для TUN без UAC",                3),
+            ("🌐", "DNS & LOGS",    "DNS-сервер, утечки, запись логов в файл",       4),
+            ("⚡", "XRAY SETTINGS", "UDP packet encoding и другие Xray-опции",       5),
         ]
         for icon, lbl, sub, page in items:
             b = self._nav_btn(icon, lbl, sub)
@@ -625,6 +679,7 @@ class SettingsDialog(QDialog):
         lay.addStretch()
         return w
 
+    # ── PAGE 1: APP ───────────────────────────────────────────────────────────
     def _page_app(self) -> QWidget:
         w = QWidget(); lay = QVBoxLayout(w)
         lay.setContentsMargins(16, 12, 16, 8); lay.setSpacing(10)
@@ -638,17 +693,43 @@ class SettingsDialog(QDialog):
         self.cb_restore.setChecked(self._s.get("restore_session", True))
         for cb in [self.cb_auto, self.cb_silent, self.cb_restore]:
             gl.addWidget(cb)
-        hint = QLabel("Тихий старт + восстановление сессии = автоподключение без участия пользователя.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#475569;font-family:monospace;font-size:9px;")
-        gl.addWidget(hint)
-        lay.addWidget(grp); lay.addStretch()
+        lay.addWidget(grp)
+
+        log_grp = QGroupBox("ЛОГИ"); ll = QVBoxLayout(log_grp); ll.setSpacing(8)
+        self.cb_log_to_file = QCheckBox("Записывать логи ядра в файл  (logs/sb.log / xray.log)")
+        self.cb_log_to_file.setChecked(self._s.get("log_to_file", True))
+        ll.addWidget(self.cb_log_to_file)
+        self.cb_delete_logs_on_exit = QCheckBox("Очищать логи при выходе из приложения")
+        self.cb_delete_logs_on_exit.setChecked(self._s.get("delete_logs_on_exit", False))
+        ll.addWidget(self.cb_delete_logs_on_exit)
+        lay.addWidget(log_grp)
+
+        gen_grp = QGroupBox("КОНФИГ"); gl2 = QVBoxLayout(gen_grp); gl2.setSpacing(8)
+        self.cb_use_gen_config = QCheckBox("Использовать генерируемый конфиг  (по умолчанию)")
+        self.cb_use_gen_config.setChecked(self._s.get("use_gen_config", True))
+        gl2.addWidget(self.cb_use_gen_config)
+        custom_row = QHBoxLayout(); custom_row.setSpacing(6)
+        self.le_custom_config = QLineEdit(self._s.get("custom_config_path", ""))
+        self.le_custom_config.setPlaceholderText("Путь к своему config.json / config.yaml...")
+        self.le_custom_config.setStyleSheet(input_style())
+        b_browse = QPushButton("📂"); b_browse.setFixedWidth(30)
+        b_browse.setStyleSheet(btn_style())
+        b_browse.clicked.connect(self._browse_config)
+        custom_row.addWidget(self.le_custom_config); custom_row.addWidget(b_browse)
+        gl2.addLayout(custom_row)
+        self.cb_use_gen_config.toggled.connect(self.le_custom_config.setDisabled)
+        self.le_custom_config.setDisabled(self._s.get("use_gen_config", True))
+        lay.addWidget(gen_grp)
+
+        lay.addStretch()
         return w
 
+    # ── PAGE 2: TUN ───────────────────────────────────────────────────────────
     def _page_tun(self) -> QWidget:
         w = QWidget(); lay = QVBoxLayout(w)
         lay.setContentsMargins(16, 12, 16, 8); lay.setSpacing(10)
 
+        # Core settings
         grp1 = QGroupBox("TUN CORE"); g1 = QVBoxLayout(grp1); g1.setSpacing(8)
         r1 = QHBoxLayout()
         r1.addWidget(QLabel("Stack:"))
@@ -673,6 +754,7 @@ class SettingsDialog(QDialog):
             g1.addWidget(cb)
         lay.addWidget(grp1)
 
+        # Route exclude
         grp2 = QGroupBox("ROUTE EXCLUDE ADDRESS"); g2 = QVBoxLayout(grp2); g2.setSpacing(6)
         self.cb_auto_gw = QCheckBox("Автоматически добавлять шлюз (/32) при запуске")
         self.cb_auto_gw.setChecked(self._s.get("route_exclude_auto_gw", True))
@@ -694,23 +776,15 @@ class SettingsDialog(QDialog):
             b.setStyleSheet(btn_style(accent=acc, danger=dng))
             b.clicked.connect(fn); er.addWidget(b)
         g2.addLayout(er)
-        hint2 = QLabel("Шлюз и LAN-подсети должны быть в этом списке.")
-        hint2.setStyleSheet("color:#475569;font-family:monospace;font-size:9px;")
-        g2.addWidget(hint2)
         lay.addWidget(grp2); lay.addStretch()
         return w
 
+    # ── PAGE 3: SERVICE ───────────────────────────────────────────────────────
     def _page_service(self) -> QWidget:
         w = QWidget(); lay = QVBoxLayout(w)
         lay.setContentsMargins(16, 12, 16, 8); lay.setSpacing(10)
 
         grp = QGroupBox("WINDOWS SERVICE  (sb-hy2)"); gl = QVBoxLayout(grp); gl.setSpacing(8)
-        hint = QLabel(
-            "Устанавливает системный сервис. После установки "
-            "TUN-режим запускается без UAC-запроса.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#64748b;font-family:monospace;font-size:9px;")
-        gl.addWidget(hint)
 
         port_row = QHBoxLayout(); port_row.setSpacing(6)
         port_row.addWidget(QLabel("HTTP API порт:"))
@@ -720,13 +794,7 @@ class SettingsDialog(QDialog):
         port_row.addWidget(self.le_svc_port)
         port_row.addStretch()
         gl.addLayout(port_row)
-        port_hint = QLabel(
-            "Изменится после сохранения и переустановки/перезапуска сервиса "
-            "(Delete Service → Install Service). Не должен совпадать с другими "
-            "локальными портами на машине.")
-        port_hint.setWordWrap(True)
-        port_hint.setStyleSheet("color:#475569;font-family:monospace;font-size:9px;")
-        gl.addWidget(port_hint)
+        gl.addStretch()
 
         self.task_status = QLabel("")
         self.task_status.setStyleSheet("font-family:monospace;font-size:9px;")
@@ -745,6 +813,65 @@ class SettingsDialog(QDialog):
         lay.addWidget(grp); lay.addStretch()
         return w
 
+    # ── PAGE 4: DNS & LOGS ───────────────────────────────────────────────────
+    def _page_dns(self) -> QWidget:
+        w = QWidget(); lay = QVBoxLayout(w)
+        lay.setContentsMargins(16, 12, 16, 8); lay.setSpacing(10)
+
+        # DNS
+        dns_grp = QGroupBox("DNS"); dl = QVBoxLayout(dns_grp); dl.setSpacing(10)
+        row_up = QHBoxLayout(); row_up.setSpacing(6)
+        row_up.addWidget(QLabel("Upstream:"))
+        self.le_dns_upstream = QLineEdit(self._s.get("dns_upstream", "1.1.1.1"))
+        self.le_dns_upstream.setStyleSheet(input_style())
+        self.le_dns_upstream.setFixedWidth(130)
+        row_up.addWidget(self.le_dns_upstream)
+        for label, ip in [("CF", "1.1.1.1"), ("Google", "8.8.8.8"), ("Quad9", "9.9.9.9"), ("AdGuard", "94.140.14.14")]:
+            b = QPushButton(label); b.setFixedHeight(22); b.setFixedWidth(58)
+            b.setStyleSheet(btn_style())
+            b.clicked.connect(lambda _, v=ip: self.le_dns_upstream.setText(v))
+            row_up.addWidget(b)
+        row_up.addStretch()
+        dl.addLayout(row_up)
+
+
+        self.cb_no_leak = QCheckBox("Без DNS-утечек  (Fake-IP)  [только TUN]")
+        self.cb_no_leak.setChecked(self._s.get("dns_no_leak", True))
+        dl.addWidget(self.cb_no_leak)
+        lay.addWidget(dns_grp)
+
+        lay.addStretch()
+        return w
+
+    # ── PAGE 5: XRAY SETTINGS ────────────────────────────────────────────────
+    def _page_xray(self) -> QWidget:
+        w = QWidget(); lay = QVBoxLayout(w)
+        lay.setContentsMargins(16, 12, 16, 8); lay.setSpacing(10)
+
+        grp = QGroupBox("VLESS / XRAY"); gl = QVBoxLayout(grp); gl.setSpacing(10)
+
+        enc_row = QHBoxLayout(); enc_row.setSpacing(8)
+        enc_row.addWidget(QLabel("UDP Packet Encoding:"))
+        self.cb_udp_enc = QComboBox()
+        self.cb_udp_enc.addItems(["none", "xudp", "packetaddr"])
+        self.cb_udp_enc.setCurrentText(self._s.get("xray_udp_encoding", "none"))
+        self.cb_udp_enc.setStyleSheet(input_style())
+        enc_row.addWidget(self.cb_udp_enc); enc_row.addStretch()
+        gl.addLayout(enc_row)
+
+        lay.addWidget(grp)
+        lay.addStretch()
+        return w
+
+    def _browse_config(self):
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выбрать конфиг", "",
+            "Config files (*.json *.yaml *.yml);;All files (*)")
+        if path:
+            self.le_custom_config.setText(path)
+
+    # ── Helpers: exclude address ──────────────────────────────────────────────
     def _excl_add(self):
         val = self.le_excl.text().strip()
         if not val: return
@@ -772,6 +899,7 @@ class SettingsDialog(QDialog):
         else:
             QMessageBox.information(self, "Auto GW", f"Уже в списке: {cidr}")
 
+    # ── Helpers: service ─────────────────────────────────────────────────────
     def _refresh_task_status(self):
         if service_installed():
             self.task_status.setText("● Статус: УСТАНОВЛЕН")
@@ -800,6 +928,7 @@ class SettingsDialog(QDialog):
         if ok: QMessageBox.information(self, "Готово", "Сервис удалён.")
         else:  QMessageBox.warning(self, "Ошибка", f"Не удалось:\n{msg}")
 
+    # ── Save ──────────────────────────────────────────────────────────────────
     def _save(self):
         set_autostart(self.cb_auto.isChecked())
         self._s["silent_start"]    = self.cb_silent.isChecked()
@@ -826,9 +955,19 @@ class SettingsDialog(QDialog):
                 "Порт сервиса должен быть числом 1024–65535.")
             return
 
+        upstream = self.le_dns_upstream.text().strip()
+        self._s["dns_upstream"] = upstream or "1.1.1.1"
+        self._s["dns_no_leak"]  = self.cb_no_leak.isChecked()
+        self._s["log_to_file"]  = self.cb_log_to_file.isChecked()
+        self._s["delete_logs_on_exit"]   = self.cb_delete_logs_on_exit.isChecked()
+        self._s["use_gen_config"]        = self.cb_use_gen_config.isChecked()
+        self._s["custom_config_path"]    = self.le_custom_config.text().strip()
+        self._s["xray_udp_encoding"]     = self.cb_udp_enc.currentText()
+
         save_settings(self._s)
         self.accept()
 
+# ── ПРЕСЕТЫ И РЕДАКТОР ПРАВИЛ ────────────────────────────────────────────────
 DEFAULT_PRESETS = {
     "🌐 Global — всё через прокси": [
         {"type":"MATCH","value":"","action":"proxy"}
@@ -882,8 +1021,19 @@ def save_presets(p: dict):
         json.dump(p, f, indent=2, ensure_ascii=False)
 
 class _RuleTable(QTableWidget):
-    
-    rowsReordered = pyqtSignal(int, int)
+    """
+    QTableWidget с перетаскиванием строк мышью.
+
+    Встроенный QAbstractItemView.DragDropMode.InternalMove у QTableWidget
+    двигает данные на уровне отдельных ячеек модели, а не строк целиком —
+    из-за этого визуально иногда "теряются" QTableWidgetItem на новой
+    позиции строки (выглядит как пустая строка, пока не переоткрыть диалог
+    и не вызвать полный _refresh()). Поэтому здесь стандартное поведение
+    перетаскивания полностью отключено (event.ignore()), а перестановка
+    делается вручную через сигнал — на уровне списка self._rules в
+    RulesDialog с последующей полной перерисовкой таблицы.
+    """
+    rowsReordered = pyqtSignal(int, int)   # from_row, to_row
 
     def dropEvent(self, event):
         if event.source() is not self:
@@ -898,9 +1048,10 @@ class _RuleTable(QTableWidget):
         target = self.indexAt(pos).row()
         if target == -1:
             target = self.rowCount() - 1
-        event.ignore()
+        event.ignore()   # никогда не пускаем Qt в его собственную реализацию move
         if target != from_row:
             self.rowsReordered.emit(from_row, target)
+
 
 class RulesDialog(QDialog):
     def __init__(self, parent=None):
@@ -915,20 +1066,20 @@ class RulesDialog(QDialog):
         lbl_p = QLabel("Пресет:")
         lbl_p.setStyleSheet("color:#7c3aed;font-family:monospace;font-size:10px;font-weight:bold;")
         preset_row.addWidget(lbl_p)
-
+        
         self.preset_cb = QComboBox()
         self.preset_cb.addItems(list(self._presets.keys()))
         self.preset_cb.setStyleSheet(input_style())
         preset_row.addWidget(self.preset_cb, 1)
-
+        
         b_load = QPushButton("Загрузить"); b_load.setStyleSheet(btn_style())
         b_save_p = QPushButton("💾 Сохранить"); b_save_p.setStyleSheet(btn_style(accent=True))
         b_del_p = QPushButton("🗑"); b_del_p.setStyleSheet(btn_style(danger=True))
-
+        
         b_load.clicked.connect(self._load_preset)
         b_save_p.clicked.connect(self._save_preset)
         b_del_p.clicked.connect(self._delete_preset)
-
+        
         preset_row.addWidget(b_load)
         preset_row.addWidget(b_save_p)
         preset_row.addWidget(b_del_p)
@@ -942,6 +1093,7 @@ class RulesDialog(QDialog):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setStyleSheet(table_style())
+        # Перетаскивание строк мышью вместо кнопок ▲/▼
         self.table.setDragEnabled(True)
         self.table.setAcceptDrops(True)
         self.table.setDropIndicatorShown(True)
@@ -1053,7 +1205,11 @@ class RulesDialog(QDialog):
         self._refresh()
 
     def _reorder_rule(self, from_row: int, to_row: int):
-        
+        """
+        Перестановка элемента self._rules на новое место + полная
+        перерисовка таблицы из данных. Не трогаем QTableWidgetItem-ы
+        напрямую — это и есть лекарство от "пустой строки" после drag&drop.
+        """
         if not (0 <= from_row < len(self._rules)):
             return
         rule = self._rules.pop(from_row)
@@ -1070,6 +1226,7 @@ class RulesDialog(QDialog):
         with open(RULES_FILE,"w",encoding="utf-8") as f: f.write("\n".join(lines)+"\n")
         self.accept()
 
+# ── ПОТОК СБОРА СОЕДИНЕНИЙ ────────────────────────────────────────────────────
 class ConnectionsWorker(QThread):
     updated = pyqtSignal(list)
     def __init__(self):
@@ -1114,6 +1271,7 @@ class ConnectionsWorker(QThread):
                     key=lambda r:(r["status"]=="CLOSED",r["first_seen"]))
         self.updated.emit(rows)
 
+# ── ДИАЛОГ СОЕДИНЕНИЙ ─────────────────────────────────────────────────────────
 class ConnectionsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1214,9 +1372,111 @@ class ConnectionsDialog(QDialog):
 
     def closeEvent(self,_): self._worker.stop()
 
+# ── ПОТОК И ПАНЕЛЬ ЛОГОВ ──────────────────────────────────────────────────────
+def _fmt_bytes(b: float) -> str:
+    """Умное форматирование: B → KB → MB → GB → TB."""
+    for unit in ("B","KB","MB","GB"):
+        if abs(b) < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.2f} TB"
+
+
+class SpeedGraphWidget(QWidget):
+    """
+    Мини-граф скорости сети в реальном времени + суммарные счётчики.
+    Использует psutil для получения bytes_sent/bytes_recv с интервалом 1 сек.
+    Отображает:
+      — два кривых линий (▼ download зелёный, ▲ upload синий)
+      — текущую скорость и суммарный трафик
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dl_hist = []   # [bytes/s] последние N точек
+        self._ul_hist = []
+        self._max_pts = 60   # 60 сек истории
+        self._total_dl = 0.0
+        self._total_ul = 0.0
+        self._last_bytes = None
+        self._timer = QTimer(self, interval=1000, timeout=self._sample)
+
+    def start(self):
+        try:
+            import psutil
+            c = psutil.net_io_counters()
+            self._last_bytes = (c.bytes_recv, c.bytes_sent)
+        except Exception:
+            self._last_bytes = None
+        self._timer.start()
+
+    def stop_sampling(self):
+        self._timer.stop()
+
+    def _sample(self):
+        try:
+            import psutil
+            c = psutil.net_io_counters()
+            cur = (c.bytes_recv, c.bytes_sent)
+            if self._last_bytes:
+                dl = max(0.0, cur[0] - self._last_bytes[0])
+                ul = max(0.0, cur[1] - self._last_bytes[1])
+                self._dl_hist.append(dl); self._ul_hist.append(ul)
+                self._total_dl += dl;     self._total_ul += ul
+                if len(self._dl_hist) > self._max_pts:
+                    self._dl_hist.pop(0); self._ul_hist.pop(0)
+            self._last_bytes = cur
+            self.update()
+        except Exception:
+            pass
+
+    def paintEvent(self, _):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        p.fillRect(0, 0, W, H, QColor("#0a0a14"))
+
+        # Grid lines
+        p.setPen(QPen(QColor("#1e293b"), 1))
+        for i in range(1, 4):
+            y = int(H * i / 4)
+            p.drawLine(0, y, W, y)
+
+        def _draw_curve(hist, color):
+            if len(hist) < 2: return
+            peak = max(max(hist), 1)
+            pts = len(hist)
+            step = W / max(pts - 1, 1)
+            path = QPainterPath()
+            x0 = W - (pts - 1) * step
+            y0 = H - int(hist[0] / peak * (H - 4)) - 2
+            path.moveTo(x0, y0)
+            for i, v in enumerate(hist[1:], 1):
+                x = x0 + i * step
+                y = H - int(v / peak * (H - 4)) - 2
+                path.lineTo(x, y)
+            p.setPen(QPen(QColor(color), 1.5))
+            p.drawPath(path)
+
+        _draw_curve(self._dl_hist, "#10b981")   # зелёный ▼
+        _draw_curve(self._ul_hist, "#3b82f6")   # синий   ▲
+
+        # Stats overlay
+        dl_spd = self._dl_hist[-1] if self._dl_hist else 0
+        ul_spd = self._ul_hist[-1] if self._ul_hist else 0
+        p.setPen(QPen(QColor("#10b981")))
+        p.setFont(QFont("monospace", 8))
+        p.drawText(4, 13, f"▼ {_fmt_bytes(dl_spd)}/s   total {_fmt_bytes(self._total_dl)}")
+        p.setPen(QPen(QColor("#3b82f6")))
+        p.drawText(4, 27, f"▲ {_fmt_bytes(ul_spd)}/s   total {_fmt_bytes(self._total_ul)}")
+
+
 class LogTailThread(QThread):
-    
-    new_lines = pyqtSignal(list)
+    """
+    Следит за ДВУМЯ лог-файлами одновременно (sb.log и xray.log) и
+    эмиттит строки с тегом источника — нужно для фильтра XRAY/SING-BOX/CRYSTALL
+    в LogPanel. Раньше отслеживался только sb.log, из-за чего в dual-core
+    режиме (sing-box TUN + Xray SOCKS5-бэкенд) лог Xray просто не показывался.
+    """
+    new_lines = pyqtSignal(list)   # список (source:str, line:str)
 
     def __init__(self):
         super().__init__()
@@ -1234,6 +1494,8 @@ class LogTailThread(QThread):
                     if not os.path.exists(path):
                         continue
                     size = os.path.getsize(path)
+                    # Файл стал короче (очистили логи) — сбрасываем позицию,
+                    # иначе seek() уйдёт за конец и ничего не прочитается.
                     if self._pos[path] > size:
                         self._pos[path] = 0
                     with open(path, encoding="utf-8", errors="replace") as f:
@@ -1261,22 +1523,25 @@ class LogPanel(QWidget):
         self.lbl.setStyleSheet("color:#7c3aed;font-family:monospace;font-size:9px;font-weight:bold;")
         tb.addWidget(self.lbl)
 
+        # Фильтр по уровню (как и раньше)
         self.level=QComboBox(); self.level.addItems(["ALL","INFO","WARN","ERROR"])
         self.level.setFixedWidth(64)
         self.level.setStyleSheet(input_style())
         self.level.currentTextChanged.connect(self._refilter)
         tb.addWidget(self.level)
 
+        # Фильтр по источнику: XRAY / SING-BOX / CRYSTALL (лог самого приложения)
         self.source=QComboBox(); self.source.addItems(["ALL","SING-BOX","XRAY","CRYSTALL"])
         self.source.setFixedWidth(82)
         self.source.setStyleSheet(input_style())
         self.source.currentTextChanged.connect(self._refilter)
         tb.addWidget(self.source)
 
-        self.b_conn=QPushButton("CONNECTIONS")
-        self.b_conn.setStyleSheet(btn_style() +
+        self.b_view_toggle=QPushButton("📊 GRAPHS")
+        self.b_view_toggle.setStyleSheet(btn_style() +
             "QPushButton{padding:3px 10px;min-height:26px;}")
-        tb.addWidget(self.b_conn)
+        self.b_view_toggle.clicked.connect(self._toggle_view)
+        tb.addWidget(self.b_view_toggle)
 
         self.b_clear=QPushButton("🗑 CLEAR")
         self.b_clear.setStyleSheet(btn_style(danger=True) +
@@ -1298,20 +1563,25 @@ class LogPanel(QWidget):
             "font-family:monospace;font-size:9px;padding:4px;}")
         lay.addWidget(self.text)
 
-        self._all_lines=[]; self._visible=True
+        self.graph=SpeedGraphWidget()
+        self.graph.setFixedHeight(100)
+        self.graph.hide()
+        lay.addWidget(self.graph)
+
+        self._all_lines=[]; self._visible=True; self._show_graphs=False
         self._tail=LogTailThread()
         self._tail.new_lines.connect(self._on_lines)
         self._tail.start()
 
     def append(self, msg):
-        
+        """Лог самого приложения (CRYSTALL) — READY (имя инбаунда) и подобное."""
         entry = {"source": "CRYSTALL", "level": "INFO", "text": msg}
         self._all_lines.append(entry)
         if self._visible and self._matches(entry):
             self._put(f"<span style='color:#a78bfa'>[CRYSTALL] › {msg}</span>")
 
     def _on_lines(self, lines):
-        
+        """lines: список (source, raw_line) от LogTailThread."""
         for source, raw in lines:
             raw=strip_ansi(raw).rstrip()
             if not raw: continue
@@ -1344,7 +1614,11 @@ class LogPanel(QWidget):
                 self._put(self._color(entry))
 
     def _clear_logs(self):
-        
+        """
+        Стирает логи на диске (sb.log, xray.log) и в памяти панели.
+        Сбрасывает позицию tail-потока, иначе он попытается прочитать
+        с офсета, который теперь за пределами усечённого файла.
+        """
         try:
             from runner import clear_logs
             clear_logs()
@@ -1355,11 +1629,24 @@ class LogPanel(QWidget):
         self._tail.reset()
         self.append("Логи очищены")
 
+    def _toggle_view(self):
+        self._show_graphs = not self._show_graphs
+        if self._show_graphs:
+            self.b_view_toggle.setText("📝 LOGS")
+            self.text.hide()
+            self.graph.show()
+            self.graph.start()
+        else:
+            self.b_view_toggle.setText("📊 GRAPHS")
+            self.graph.hide()
+            self.graph.stop_sampling()
+            self.text.show()
+
     def _toggle(self):
         self._visible=not self._visible
-
-        for w in (self.lbl, self.level, self.source, self.b_conn,
-                  self.b_clear, self.text):
+        content_widget = self.graph if self._show_graphs else self.text
+        for w in (self.lbl, self.level, self.source, self.b_view_toggle,
+                  self.b_clear, content_widget):
             w.setVisible(self._visible)
 
         if self._visible:
@@ -1383,12 +1670,14 @@ class LogPanel(QWidget):
     def reset_tail(self): self._tail.reset()
     def stop(self): self._tail.stop()
 
+# ── ПЛИТКИ: ОБЩИЕ ХЕЛПЕРЫ ─────────────────────────────────────────────────────
 def _hex_to_rgba(hex_color: str, alpha: float) -> str:
     hex_color = (hex_color or "#7c3aed").lstrip("#")
     if len(hex_color) != 6:
         hex_color = "7c3aed"
     r = int(hex_color[0:2], 16); g = int(hex_color[2:4], 16); b = int(hex_color[4:6], 16)
     return f"rgba({r},{g},{b},{alpha})"
+
 
 def _tile_btn_style() -> str:
     return (
@@ -1397,8 +1686,9 @@ def _tile_btn_style() -> str:
         "QPushButton:pressed{color:#7c3aed;}"
     )
 
+
 class TileButton(QFrame):
-    
+    """Базовая 'плитка' — кликабельный QFrame фиксированного размера."""
     clicked = pyqtSignal()
 
     def __init__(self, w: int = 148, h: int = 104, parent=None):
@@ -1411,8 +1701,9 @@ class TileButton(QFrame):
             self.clicked.emit()
         super().mousePressEvent(e)
 
+
 class AddTile(TileButton):
-    
+    """Плитка '+' — обводка пунктиром, плюс по центру."""
     def __init__(self, parent=None):
         super().__init__(parent=parent)
         self.setStyleSheet(
@@ -1425,8 +1716,9 @@ class AddTile(TileButton):
         plus.setStyleSheet("color:#475569;font-size:34px;border:none;background:transparent;")
         lay.addWidget(plus)
 
+
 class ClusterTile(TileButton):
-    
+    """Плитка кластера: имя, кол-во инбаундов, ✎ редактировать, 🔄 обновить подписку."""
     editRequested = pyqtSignal()
     refreshRequested = pyqtSignal()
 
@@ -1473,8 +1765,9 @@ class ClusterTile(TileButton):
         sub.setStyleSheet("color:#94a3b8;font-family:monospace;font-size:8px;border:none;background:transparent;")
         lay.addWidget(sub)
 
+
 class InboundTile(TileButton):
-    
+    """Плитка инбаунда: протокол, имя, host:port, ping, ✎ переименовать, 🗑 удалить."""
     editRequested = pyqtSignal()
     deleteRequested = pyqtSignal()
 
@@ -1536,6 +1829,8 @@ class InboundTile(TileButton):
         self.ping_label.setStyleSheet(
             f"color:{color};font-family:monospace;font-size:9px;border:none;background:transparent;")
 
+
+# ── РЕДАКТОР КЛАСТЕРА (имя / цвет / ссылка подписки / удалить) ───────────────
 class ClusterEditDialog(QDialog):
     def __init__(self, data: dict, path: str, parent=None):
         super().__init__(parent)
@@ -1612,6 +1907,8 @@ class ClusterEditDialog(QDialog):
             cm.delete_cluster(self.path)
             self.accept()
 
+
+# ── ИНБАУНДЫ ВНУТРИ КЛАСТЕРА (плитки) ────────────────────────────────────────
 class InboundsGridDialog(QDialog):
     def __init__(self, path: str, data: dict, runner=None, active_mode="proxy", parent=None):
         super().__init__(parent)
@@ -1643,6 +1940,9 @@ class InboundsGridDialog(QDialog):
         lay.addWidget(self.ping_hint)
 
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        # Явно задаём тёмный фон и самому QScrollArea, и его viewport —
+        # "background:transparent" само по себе не гарантирует, что сквозь
+        # него не проступит светлый дефолтный фон QWidget без стиля.
         self.scroll.setStyleSheet("QScrollArea{border:none;background:#13131f;}")
         self.scroll.viewport().setStyleSheet("background:#13131f;")
         self.grid_host = QWidget()
@@ -1744,8 +2044,16 @@ class InboundsGridDialog(QDialog):
         color = "#10b981" if ms < 200 else ("#f59e0b" if ms < 600 else "#ef4444")
         return f"{ms:.0f}ms", color
 
+
+# ── МЕНЕДЖЕР КЛАСТЕРОВ (плитки) ───────────────────────────────────────────────
 class ProfileDialog(QDialog):
-    
+    """
+    1 кластер = 1 плитка. Клик по плитке → список инбаундов этого кластера
+    (тоже плитками). ✎ на плитке кластера → редактирование (имя/цвет/ссылка/
+    удалить). 🔄 (только если есть подписка) → обновить подписку с пересчётом
+    IP, не теряя вручную добавленные (custom) инбаунды. Последняя плитка — '+'
+    → импорт подписки или пустой кластер.
+    """
     def __init__(self, runner=None, active_mode="proxy", parent=None):
         super().__init__(parent)
         self.setWindowTitle("CLUSTERS"); self.setFixedSize(660, 540)
@@ -1760,6 +2068,9 @@ class ProfileDialog(QDialog):
         lay.addWidget(hdr)
 
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        # Явно задаём тёмный фон и самому QScrollArea, и его viewport —
+        # "background:transparent" само по себе не гарантирует, что сквозь
+        # него не проступит светлый дефолтный фон QWidget без стиля.
         self.scroll.setStyleSheet("QScrollArea{border:none;background:#13131f;}")
         self.scroll.viewport().setStyleSheet("background:#13131f;")
         self.grid_host = QWidget()
@@ -1816,7 +2127,7 @@ class ProfileDialog(QDialog):
             self.selected_data = d.selected_data
             self.accept()
         else:
-            self._refresh()
+            self._refresh()   # переименование/удаление внутри тоже отражаем
 
     def _edit_cluster(self, path: str, data: dict):
         d = ClusterEditDialog(data, path, parent=self)
@@ -1866,6 +2177,7 @@ class ProfileDialog(QDialog):
         cm.create_empty_cluster(name.strip())
         self._refresh()
 
+# ── ИКОНКА ТРЕЯ ───────────────────────────────────────────────────────────────
 def _make_tray_icon(color: QColor) -> QIcon:
     px=QPixmap(32,32); px.fill(Qt.GlobalColor.transparent)
     p=QPainter(px); p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1875,9 +2187,16 @@ def _make_tray_icon(color: QColor) -> QIcon:
     p.setBrush(color); p.setPen(Qt.PenStyle.NoPen); p.drawPath(path); p.end()
     return QIcon(px)
 
+# ── ГЛАВНОЕ ОКНО ──────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # ── Очистка ДО создания Runner и любых процессов ────────────────────
+        # 1. Логи — стираются на каждом старте приложения (см. кнопка CLEAR
+        #    в LogPanel делает то же самое вручную).
+        # 2. Зомби sing-box.exe/xray.exe и зависшие TUN-адаптеры от прошлого
+        #    аварийного завершения — без этого sing-box иногда падает с
+        #    'FATAL cannot create file that already exists'.
         try:
             from runner import clear_logs, cleanup_stale_state
             clear_logs()
@@ -1886,7 +2205,7 @@ class MainWindow(QMainWindow):
             print(f"Startup cleanup failed: {e}")
 
         self.runner=Runner(); self.active_p=None
-        self._active_engine_mode=None
+        self._active_engine_mode=None   # None | "singbox" | "xray" | "dual"
         self.active_mode="proxy"; self._drag_pos=None
         self._conn_dialog=None; self._ping_thread=None
         self._active_cluster_file=""
@@ -1928,22 +2247,22 @@ class MainWindow(QMainWindow):
         self.arena=QWidget(); self.arena.setFixedSize(410,380)
         lay.addWidget(self.arena, 0, Qt.AlignmentFlag.AlignCenter)
 
-        self.b_rules=CyberBlade("RULES",  -30, self.arena); self.b_rules.move(0,  42)
-        self.b_prof =CyberBlade("CLUSTERS", 30, self.arena); self.b_prof.move(240, 42)
-        self.b_rest =CyberBlade("RESTART",  30, self.arena); self.b_rest.move(0,  272)
-        self.b_exit =CyberBlade("EXIT",    -30, self.arena); self.b_exit.move(240,272)
+        self.b_rules=CyberBlade("RULES",    -30, self.arena); self.b_rules.move(0,   42)
+        self.b_prof =CyberBlade("CLUSTERS",  30, self.arena); self.b_prof.move(240,  42)
+        self.b_conn_p=CyberBlade("CONNECTIONS",30,self.arena);self.b_conn_p.move(0,  272)
+        self.b_exit =CyberBlade("EXIT",     -30, self.arena); self.b_exit.move(240, 272)
         self.dia=DiamondWidget(self.arena); self.dia.move(120,82)
 
         self.b_rules.clicked.connect(self._open_rules)
         self.b_prof.clicked.connect(self._select)
-        self.b_rest.clicked.connect(self._restart_core)
+        self.b_conn_p.clicked.connect(self._open_connections)
         self.b_exit.clicked.connect(self._exit_dialog)
         self.dia.clicked.connect(self._toggle)
 
         self.log_panel=LogPanel()
-        self.log_panel.b_conn.clicked.connect(self._open_connections)
         lay.addWidget(self.log_panel)
 
+        # ── Индикаторы-лепестки ───────────────────────────────────────────────
         ind_row = QHBoxLayout(); ind_row.setSpacing(10)
         ind_row.addStretch()
         self.ind_core = PetalIndicator("SING-BOX")
@@ -1958,6 +2277,7 @@ class MainWindow(QMainWindow):
         ind_row.addStretch()
         lay.addLayout(ind_row)
 
+        # Watchdog: каждые 2 сек проверяем реальное состояние процесса
         self._watchdog = QTimer(self, interval=2000, timeout=self._watchdog_tick)
         self._watchdog.start()
 
@@ -2011,6 +2331,9 @@ class MainWindow(QMainWindow):
         self.showNormal(); self.activateWindow(); self.raise_()
 
     def _quit_app(self):
+        s = load_settings()
+        if s.get("delete_logs_on_exit", False):
+            self.log_panel._clear_logs()
         self.log_panel.stop(); self.runner.stop(); QApplication.quit()
 
     def _exit_dialog(self):
@@ -2053,13 +2376,19 @@ class MainWindow(QMainWindow):
         if self.runner.proc:
             self._log("FORCING CORE RESTART...")
             self.runner.stop()
+            # Для TUN-режима нужно больше времени: сервис async + адаптер должен упасть
             delay = 1800 if self.active_mode == "tun" else 600
             QTimer.singleShot(delay, self._toggle)
         else:
             self._log("CORE NOT RUNNING")
 
     def _on_indicator_clicked(self, label: str):
-        
+        """
+        Клик по индикатору SING-BOX/XRAY/SERVICE — показывает меню с опциями:
+          'Kill process' — жёстко убивает именно этот движок (taskkill),
+                           полезно если процесс завис и не реагирует на stop().
+          'Выйти'        — полный выход из приложения.
+        """
         if label == "SERVICE":
             QMessageBox.information(self, "SERVICE",
                 "Управление Windows-сервисом — в Настройках (⚙).")
@@ -2081,6 +2410,7 @@ class MainWindow(QMainWindow):
         if chosen == a_kill:
             self.runner.force_kill(engine)
             self._log(f"KILLED {label} (вручную, через индикатор)")
+            # Состояние сессии могло держаться на этом процессе — сбрасываем
             if (engine == "xray" and self.active_p and
                     self.active_p.get("protocol") == "vless") or \
                (engine == "singbox" and self.active_p and
@@ -2093,14 +2423,35 @@ class MainWindow(QMainWindow):
             self._quit_app()
 
     def _safe_background_check(self):
-        
+        """
+        Вызывается через QTimer.singleShot(3000, ...) сразу после успешного
+        runner.start(), чтобы поймать случай, когда API/сервис ответил "ok",
+        но реальный процесс движка по факту не поднялся или сразу упал
+        (например неверный конфиг). Раньше этот метод вызывался, но не
+        существовал — таймер тихо проглатывал AttributeError и проверка
+        никогда не выполнялась.
+
+        Просто форсирует немедленный watchdog-тик вместо ожидания до 2 сек
+        обычного интервала, обёрнутый в try/except, чтобы единичный сбой
+        здесь никогда не уронил приложение.
+        """
         try:
             self._watchdog_tick()
         except Exception as e:
             self._log(f"⚠ background check error: {e}")
 
     def _watchdog_tick(self):
-        
+        """
+        Watchdog честно отражает состояние КАЖДОГО движка, который реально
+        нужен в текущем режиме (self._active_engine_mode):
+          "singbox" — только sing-box (hy2 любой, VLESS native-TUN)
+          "xray"    — только Xray (VLESS PROXY)
+          "dual"    — ОБА движка одновременно (VLESS TUN dual-core):
+                      раньше тут принудительно гасился ind_core, теперь
+                      оба индикатора показывают РЕАЛЬНОЕ состояние своего
+                      процесса независимо друг от друга.
+          None      — не подключены, оба индикатора неактивны.
+        """
         mode = getattr(self, "_active_engine_mode", None)
 
         if mode is None:
@@ -2115,6 +2466,15 @@ class MainWindow(QMainWindow):
         sb_alive = self._is_singbox_running() if needs_sb else None
         xr_alive = self._is_xray_running()    if needs_xr else None
 
+        # Индикаторы — независимо друг от друга, только то что реально нужно.
+        # ПРИМЕЧАНИЕ: раньше тут также проверялся "рост" лог-файла за
+        # последние 4 секунды, но при тике watchdog каждые 2 секунды это
+        # условие математически было всегда True — то есть проверка ничего
+        # не проверяла и просто маскировала реальное состояние. Плюс на
+        # простом PROXY без активного трафика sing-box может не писать в
+        # лог вообще, что ложно гасило индикатор в "error". Теперь индикатор
+        # отражает только факт того, жив ли процесс — это и надёжнее, и
+        # честнее показывает реальное состояние движка.
         if needs_sb:
             self.ind_core.set_state("active" if sb_alive else "error")
         else:
@@ -2125,6 +2485,8 @@ class MainWindow(QMainWindow):
         else:
             self.ind_xray.set_state("inactive")
 
+        # Главный алмаз (dia) "on" только если ВСЕ нужные для этого режима
+        # движки живы — в dual-режиме обрыв любого из двух рвёт туннель целиком.
         overall_alive = (sb_alive if needs_sb else True) and (xr_alive if needs_xr else True)
 
         if overall_alive and self.dia.state != "on":
@@ -2143,7 +2505,7 @@ class MainWindow(QMainWindow):
         self._watchdog_service_tick()
 
     def _watchdog_service_tick(self):
-        
+        """SERVICE индикатор — отдельно, не зависит от режима движков."""
         try:
             from runner import service_installed, service_running
             if not service_installed():
@@ -2155,9 +2517,10 @@ class MainWindow(QMainWindow):
         except Exception:
             self.ind_svc.set_state("inactive")
 
+    # ── Вспомогательные методы watchdog ──────────────────────────────────────
     @staticmethod
     def _is_singbox_running() -> bool:
-        
+        """True если sing-box.exe есть среди процессов ОС."""
         if HAS_PSUTIL:
             for p in psutil.process_iter(["name"]):
                 try:
@@ -2166,6 +2529,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             return False
+        # Fallback без psutil — tasklist
         try:
             out = subprocess.check_output(
                 ["tasklist", "/FI", "IMAGENAME eq sing-box.exe", "/NH"],
@@ -2178,7 +2542,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _is_xray_running() -> bool:
-        
+        """True если xray.exe есть среди процессов ОС."""
         if HAS_PSUTIL:
             for p in psutil.process_iter(["name"]):
                 try:
@@ -2199,13 +2563,22 @@ class MainWindow(QMainWindow):
             return False
 
     def _log_is_growing(self, path: str = None) -> bool:
-        
+        """
+        True если указанный лог-файл изменился за последние ~4 сек.
+        Первый вызов для каждого пути всегда возвращает True (даём ядру
+        секунду на раскрутку). path по умолчанию — LOG_FILE (sing-box),
+        для проверки Xray передавай XRAY_LOG_FILE.
+
+        Состояние хранится по ключу path в словаре — иначе при одновременной
+        проверке двух движков (dual-core режим) они бы затирали общие
+        атрибуты self._last_log_mtime/_last_log_check друг у друга.
+        """
         if path is None:
             path = LOG_FILE
         try:
             mtime = os.path.getmtime(path)
         except OSError:
-            return False
+            return False   # файла нет вовсе
 
         now = time.monotonic()
         state = getattr(self, "_log_growing_state", None)
@@ -2217,7 +2590,8 @@ class MainWindow(QMainWindow):
         state[path] = (mtime, now)
 
         if last_mtime is None:
-            return True
+            return True    # первый вызов для этого файла — считаем OK
+        # Лог обновлялся менее 4 секунд назад относительно реального времени
         return (now - last_check) < 4.0 or (mtime != last_mtime)
 
     def _toggle(self):
@@ -2232,6 +2606,7 @@ class MainWindow(QMainWindow):
             self._active_engine_mode = None
             clear_session(); return
 
+        # ── Определяем протокол и режим ──────────────────────────────────────
         protocol = self.active_p.get("protocol", "hysteria2")
         is_vless = (protocol == "vless")
         use_tun  = (self.active_mode == "tun")
@@ -2248,6 +2623,9 @@ class MainWindow(QMainWindow):
                 else: QMessageBox.warning(self, "Отказано", "UAC-запрос отклонён.")
             return
 
+        # Полная очистка зомби-процессов и зависших TUN-адаптеров ПЕРЕД
+        # каждым стартом — устраняет 'FATAL cannot create file that already
+        # exists' и похожие ошибки из-за недочищенного состояния прошлой сессии.
         try:
             from runner import cleanup_stale_state
             cleanup_stale_state()
@@ -2257,19 +2635,28 @@ class MainWindow(QMainWindow):
         s_cfg = load_settings()
         self.log_panel.reset_tail()
 
+        # ══════════════════════════════════════════════════════════════════════
+        # VLESS + TUN — DUAL CORE ARCHITECTURE (Sing-box TUN -> Xray SOCKS5)
+        # Идеальный баланс: process_name работает через Sing-box,
+        # а XHTTP-транспорт и Reality тянет Xray на максимальной скорости.
+        # ══════════════════════════════════════════════════════════════════════
         if is_vless and use_tun:
+            # 1. Генерируем Xray backend (транспорт)
             xray_cfg = build_vless_backend(self.active_p, socks_port=2082)
             with open(os.path.join(_BASE, "temp_xray.json"), "w") as f:
                 json.dump(xray_cfg, f, indent=2)
 
+            # 2. Генерируем Sing-box TUN frontend (роутинг по процессам)
             sb_cfg = build_tun_via_socks(self.active_p, socks_port=2082, s=s_cfg)
 
+            # Форсируем оптимизации для локального моста прямо здесь
             sb_cfg["inbounds"][0]["mtu"] = 9000
             sb_cfg["outbounds"][0]["tcp_fast_open"] = True
 
             with open(os.path.join(_BASE, "temp_sb_tun.json"), "w") as f:
                 json.dump(sb_cfg, f, indent=2)
 
+            # 3. Поднимаем сначала Xray (чтобы открыл порт 2082 и ждал трафик)
             xray_ok = self.runner.start_secondary(os.path.join(_BASE, "temp_xray.json"), core="xray")
             if not xray_ok:
                 self._log("XRAY BACKEND ERR — не удалось запустить (см. лог XRAY)")
@@ -2277,13 +2664,14 @@ class MainWindow(QMainWindow):
                 self._active_engine_mode = None
                 return
 
+            # 4. Поднимаем Sing-box TUN
             ok = self.runner.start(os.path.join(_BASE, "temp_sb_tun.json"),
                                    use_tun=True, core="singbox")
             if ok:
-                self._active_engine_mode = "dual"
+                self._active_engine_mode = "dual"   # ОБА движка должны быть живы
                 self.dia.set_state("on")
-                self.ind_core.set_state("active")
-                self.ind_xray.set_state("active")
+                self.ind_core.set_state("active")    # Sing-box работает (перехват)
+                self.ind_xray.set_state("active")    # Xray работает (VLESS/XHTTP)
                 self._tray.setIcon(_make_tray_icon(C_ON))
                 self._tray.showMessage("sb-hy2", "Подключено [Dual Core TUN/VLESS]",
                                        QSystemTrayIcon.MessageIcon.Information, 2000)
@@ -2298,9 +2686,10 @@ class MainWindow(QMainWindow):
                 self.ind_core.set_state("error")
                 self.ind_xray.set_state("error")
                 self._active_engine_mode = None
-                self.runner._stop_secondary()
+                self.runner._stop_secondary()   # глушим Xray, раз sing-box не поднялся
             return
 
+        # ── Обычные режимы (VLESS PROXY / HY2 PROXY / HY2 TUN) ───────────────
         if is_vless:
             cfg        = build_vless_proxy(self.active_p, s_cfg)
             core       = "xray"
@@ -2360,6 +2749,7 @@ class MainWindow(QMainWindow):
         p=QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(QPen(C_ACCENT,1))
         p.drawRoundedRect(0,0,self.width()-1,self.height()-1,12,12)
+
 
 if __name__=="__main__":
     app=QApplication(sys.argv)
